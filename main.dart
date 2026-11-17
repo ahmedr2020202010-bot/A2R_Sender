@@ -557,7 +557,8 @@ const String kSeed = r'''
 
 class G {
   final String name, numbers, teacher;
-  const G(this.name, this.numbers, this.teacher);
+  final List<String> cats; // التصنيفات/الأيام (عمود E في Excel)
+  const G(this.name, this.numbers, this.teacher, [this.cats = const []]);
   String get key => '$name|$numbers';
   String get title => numbers.isEmpty ? name : '$name  $numbers';
 
@@ -569,10 +570,17 @@ class G {
     return name;
   }
 
-  Map<String, String> toJson() =>
-      {'name': name, 'numbers': numbers, 'teacher': teacher};
+  Map<String, dynamic> toJson() => {
+        'name': name,
+        'numbers': numbers,
+        'teacher': teacher,
+        'cats': cats,
+      };
   factory G.fromJson(Map<String, dynamic> j) => G(
-      j['name'] as String, j['numbers'] as String, j['teacher'] as String);
+      j['name'] as String,
+      j['numbers'] as String,
+      j['teacher'] as String,
+      ((j['cats'] as List?) ?? const []).map((e) => e.toString()).toList());
 }
 
 String normDigits(String s) {
@@ -594,7 +602,54 @@ String _clean(String s) => normDigits(s)
 
 final RegExp _tail = RegExp(r'^(.*?)\s*(\d[\d\s/]*)$');
 
-/// الأعمدة: A = الاسم مع الأرقام (محمد524/554)، B أو C = المعلمة، D = "إيقاف" (أي كلمة تعطّل الصف).
+const List<String> kDays = [
+  'السبت',
+  'الأحد',
+  'الاثنين',
+  'الثلاثاء',
+  'الأربعاء',
+  'الخميس',
+  'الجمعة',
+];
+const String kNoCat = '__none';
+
+/// يقسم خانة التصنيف: السبت/الثلاثاء أو السبت، الثلاثاء أو سطر لكل يوم.
+List<String> parseCats(String s) => normDigits(s)
+    .split(RegExp(r'[,،;؛/|\n]'))
+    .map(_clean)
+    .where((e) => e.isNotEmpty)
+    .toList();
+
+bool inCat(G g, String? cat) {
+  if (cat == null) return true;
+  if (cat == kNoCat) return g.cats.isEmpty && !Wa.inAnyWaCat(g);
+  final n = _nz(cat);
+  if (g.cats.any((c) => _nz(c) == n)) return true;
+  return Wa.inWaCat(g, cat);
+}
+
+/// الأيام أولاً بترتيب الأسبوع ثم باقي التصنيفات أبجدياً.
+List<String> allCats(List<G> gs) {
+  final seen = <String, String>{};
+  for (final g in gs) {
+    for (final c in g.cats) {
+      seen.putIfAbsent(_nz(c), () => c);
+    }
+  }
+  for (final k in Wa.cats.keys) {
+    seen.putIfAbsent(_nz(k), () => k);
+  }
+  final out = <String>[];
+  for (final d in kDays) {
+    final v = seen.remove(_nz(d));
+    if (v != null) out.add(v);
+  }
+  final rest = seen.values.toList()..sort();
+  out.addAll(rest);
+  return out;
+}
+
+/// الأعمدة: A = الاسم مع الأرقام (محمد524/554)، B أو C = المعلمة، D = "إيقاف" (أي كلمة تعطّل الصف)، E = التصنيف/الأيام (السبت/الثلاثاء).
 G? parseRow(List<String> c) {
   if (c.isEmpty) return null;
   final raw = _clean(c[0]);
@@ -618,7 +673,8 @@ G? parseRow(List<String> c) {
       break;
     }
   }
-  return G(name, nums, teacher);
+  final cats = c.length > 4 ? parseCats(c[4]) : <String>[];
+  return G(name, nums, teacher, cats);
 }
 
 ({List<G> groups, int dups, int off}) parseSheet(List<List<String>> rows) {
@@ -664,6 +720,7 @@ Future<bool> _tryPrepare() async {
         null,
         TextCellValue('اسم المعلمة/المعلم'),
         TextCellValue('إيقاف (اكتبي أي كلمة لتعطيل الصف)'),
+        TextCellValue('التصنيف / الأيام (مثال: السبت/الثلاثاء)'),
       ]);
       for (final line in kSeed.split('\n')) {
         if (line.trim().isEmpty) continue;
@@ -762,8 +819,18 @@ Future<bool> ask(BuildContext c, String title, String body,
 
 // ======================= أسماء الجروبات من واتساب =======================
 class Wa {
+  static final Map<String, String?> _matchC = {};
+  static Map<String, Set<String>>? _setsC;
+
+  /// يُستدعى كلما تغيّرت الأسماء المسحوبة أو التصنيفات.
+  static void invalidate() {
+    _matchC.clear();
+    _setsC = null;
+  }
+
   static List<String> get names =>
       ((Store.data['wa'] as List?) ?? const []).map((e) => e.toString()).toList();
+
   static Map<String, String> get map {
     final m = Store.data['wamap'];
     if (m is Map) {
@@ -771,6 +838,46 @@ class Wa {
     }
     return <String, String>{};
   }
+
+  /// تصنيفات واتساب المسحوبة: اسم التصنيف ← أسماء الجروبات.
+  static Map<String, List<String>> get cats {
+    final m = Store.data['wacats'];
+    if (m is Map) {
+      return m.map((k, v) => MapEntry(k.toString(),
+          ((v as List?) ?? const []).map((e) => e.toString()).toList()));
+    }
+    return <String, List<String>>{};
+  }
+
+  static Map<String, Set<String>> get _sets {
+    var c = _setsC;
+    if (c == null) {
+      c = <String, Set<String>>{};
+      for (final e in cats.entries) {
+        c[_nz(e.key)] = e.value.map(_nz).toSet();
+      }
+      _setsC = c;
+    }
+    return c;
+  }
+
+  /// اسم الجروب في واتساب المقابل لصف الشيت (يدوي ثم تلقائي).
+  static String? matchOf(G g) {
+    final m = Store.data['wamap'];
+    if (m is Map && m[g.key] is String && (m[g.key] as String).isNotEmpty) {
+      return m[g.key] as String;
+    }
+    return _matchC.putIfAbsent(g.key, () => autoMatch(g, names));
+  }
+
+  static bool inWaCat(G g, String cat) {
+    final set = _sets[_nz(cat)];
+    if (set == null) return false;
+    final m = matchOf(g);
+    return m != null && set.contains(_nz(m));
+  }
+
+  static bool inAnyWaCat(G g) => _sets.keys.any((k) => inWaCat(g, k));
 }
 
 String _nz(String s) {
@@ -823,7 +930,7 @@ String waKey(G g) {
   if (m is Map && m[g.key] is String && (m[g.key] as String).isNotEmpty) {
     return m[g.key] as String;
   }
-  return autoMatch(g, Wa.names) ?? g.searchKey;
+  return Wa.matchOf(g) ?? g.searchKey;
 }
 
 class WaGroupsScreen extends StatefulWidget {
@@ -837,6 +944,7 @@ class _WaGroupsScreenState extends State<WaGroupsScreen>
     with WidgetsBindingObserver {
   bool enabled = false, started = false, fallback = false;
   int count = 0;
+  String? scanCat; // اسم التصنيف أثناء السحب من شاشة واتساب المفتوحة
   Timer? timer;
 
   @override
@@ -865,7 +973,18 @@ class _WaGroupsScreenState extends State<WaGroupsScreen>
       final st = Map<String, dynamic>.from(raw ?? <dynamic, dynamic>{});
       if (started && st['done'] == true) {
         final l = await _ch.invokeMethod<List>('scanNames') ?? <dynamic>[];
-        Store.data['wa'] = l.map((e) => e.toString()).toList();
+        final got = l.map((e) => e.toString()).toList();
+        if (scanCat != null) {
+          final cm = Wa.cats;
+          cm[scanCat!] = got;
+          Store.data['wacats'] = cm;
+          final all = <String>{...Wa.names, ...got};
+          Store.data['wa'] = all.toList();
+        } else {
+          Store.data['wa'] = got;
+        }
+        scanCat = null;
+        Wa.invalidate();
         Store.data['waFallback'] = st['fallback'] == true;
         await Store.save();
         started = false;
@@ -880,9 +999,47 @@ class _WaGroupsScreenState extends State<WaGroupsScreen>
     } catch (_) {}
   }
 
-  Future<void> _start() async {
+  Future<String?> _askCat() async {
+    final c = TextEditingController();
+    final r = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('اسم التصنيف'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Text(
+              'افتحي WhatsApp Business الآن على التصنيف/القائمة المطلوبة بحيث تظهر جروباتها فقط، ثم اكتبي اسمه هنا.'),
+          const SizedBox(height: 8),
+          TextField(
+              controller: c,
+              decoration: const InputDecoration(hintText: 'مثال: السبت')),
+          const SizedBox(height: 8),
+          Wrap(spacing: 6, children: [
+            for (final d in kDays)
+              ActionChip(label: Text(d), onPressed: () => c.text = d),
+          ]),
+        ]),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, c.text.trim()),
+              child: const Text('ابدأ السحب')),
+        ],
+      ),
+    );
+    return (r == null || r.isEmpty) ? null : r;
+  }
+
+  Future<void> _startScreen() async {
+    final c = await _askCat();
+    if (c == null) return;
+    await _start(cat: c);
+  }
+
+  Future<void> _start({String? cat}) async {
     try {
-      await _ch.invokeMethod<bool>('startScan');
+      scanCat = cat;
+      await _ch.invokeMethod<bool>('startScan', {'screen': cat != null});
       started = true;
       timer?.cancel();
       timer = Timer.periodic(const Duration(seconds: 1), (_) => _poll());
@@ -890,6 +1047,7 @@ class _WaGroupsScreenState extends State<WaGroupsScreen>
         snack(context, 'جاري السحب من واتساب… لا تلمسي الشاشة حتى يرجع التطبيق');
       }
     } on PlatformException catch (e) {
+      scanCat = null;
       if (!mounted) return;
       snack(
           context,
@@ -925,7 +1083,7 @@ class _WaGroupsScreenState extends State<WaGroupsScreen>
     final rows = <Widget>[];
     for (final g in widget.groups) {
       final manual = map[g.key];
-      final auto = manual == null ? autoMatch(g, names) : null;
+      final auto = manual == null ? Wa.matchOf(g) : null;
       final shown = manual ?? auto;
       if (shown != null) ok++;
       rows.add(ListTile(
@@ -980,10 +1138,35 @@ class _WaGroupsScreenState extends State<WaGroupsScreen>
         ),
         const SizedBox(height: 8),
         FilledButton.icon(
-          onPressed: (enabled && !started) ? _start : null,
-          icon: const Icon(Icons.cloud_download),
-          label: const Text('سحب الأسماء من واتساب'),
+          onPressed: (enabled && !started) ? _startScreen : null,
+          icon: const Icon(Icons.label),
+          label: const Text('سحب تصنيف: من الشاشة المفتوحة في واتساب'),
         ),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          onPressed: (enabled && !started) ? () => _start() : null,
+          icon: const Icon(Icons.cloud_download),
+          label: const Text('سحب كل الأسماء (من شاشة المشاركة)'),
+        ),
+        if (Wa.cats.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Text('التصنيفات المسحوبة', style: Theme.of(context).textTheme.titleMedium),
+          for (final e in Wa.cats.entries)
+            ListTile(
+              dense: true,
+              title: Text('${e.key} (${e.value.length} جروب)'),
+              trailing: IconButton(
+                icon: const Icon(Icons.delete_outline),
+                onPressed: () async {
+                  final m = Wa.cats..remove(e.key);
+                  Store.data['wacats'] = m;
+                  Wa.invalidate();
+                  await Store.save();
+                  if (mounted) setState(() {});
+                },
+              ),
+            ),
+        ],
         const SizedBox(height: 8),
         if (names.isNotEmpty)
           Text('تمت مطابقة $ok من ${widget.groups.length} جروب',
@@ -1089,7 +1272,27 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
   List<G> groups = [];
   int dups = 0, off = 0;
   String? err;
+  String? cat; // التصنيف المحدد للإرسال (null = الكل)
   bool loading = true;
+
+  List<String> get _cats => allCats(groups);
+  String? get _cat {
+    final c = cat;
+    if (c == null || c == kNoCat) return c;
+    return _cats.any((x) => _nz(x) == _nz(c)) ? c : null;
+  }
+
+  List<G> get shown => groups.where((g) => inCat(g, _cat)).toList();
+
+  Future<void> _setCat(String? c) async {
+    setState(() => cat = c);
+    if (c == null) {
+      Store.data.remove('cat');
+    } else {
+      Store.data['cat'] = c;
+    }
+    await Store.save();
+  }
 
   @override
   void initState() {
@@ -1113,6 +1316,9 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
 
   Future<void> _init() async {
     await Store.load();
+    Wa.invalidate();
+    final sc = Store.data['cat'];
+    if (sc is String) cat = sc;
     final d = Store.data['draft'];
     if (d is Map<String, dynamic>) {
       kind = (d['kind'] as String?) ?? 'text';
@@ -1193,21 +1399,23 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
       snack(context, v);
       return;
     }
-    if (groups.isEmpty) {
-      snack(context, 'لا توجد جروبات في ملف Excel');
+    final sel = shown;
+    if (sel.isEmpty) {
+      snack(context, groups.isEmpty ? 'لا توجد جروبات في ملف Excel' : 'لا توجد جروبات في هذا التصنيف');
       return;
     }
+    final catLabel = _cat == null ? '' : ' (${_cat == kNoCat ? 'بدون تصنيف' : _cat})';
     final old = Store.job != null;
     final ok = await ask(context, 'بدء الإرسال',
-        '${kKinds[kind]} إلى ${groups.length} جروب.${old ? '\nسيتم إغلاق المهمة غير المنتهية السابقة.' : ''}',
+        '${kKinds[kind]} إلى ${sel.length} جروب$catLabel.${old ? '\nسيتم إغلاق المهمة غير المنتهية السابقة.' : ''}',
         ok: 'ابدأ');
     if (!ok || !mounted) return;
     Store.data['job'] = {
       'kind': kind,
       'text': kind == 'sticker1' || kind == 'sticker2' ? '' : text.text.trim(),
       'media': kind == 'text' ? <String>[] : media,
-      'groups': groups.map((g) => g.toJson()).toList(),
-      'st': List<String>.filled(groups.length, 'pending'),
+      'groups': sel.map((g) => g.toJson()).toList(),
+      'st': List<String>.filled(sel.length, 'pending'),
       'finished': false,
     };
     _saveDraft();
@@ -1249,9 +1457,45 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
               child: Text('${groups.length} جروب جاهز'
                   '${dups > 0 ? ' • مكرر تم تجاهله: $dups' : ''}'
                   '${off > 0 ? ' • موقوف: $off' : ''}\n'
-                  'الملف: $kFile'),
+                  'الملف: $kFile'
+                  '${_cat != null ? '\nالمحدد للإرسال: ${shown.length} جروب' : ''}'),
             ),
           ),
+        if (err == null && _cats.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('الإرسال إلى:',
+                        style: Theme.of(context).textTheme.titleSmall),
+                    const SizedBox(height: 8),
+                    Wrap(spacing: 8, runSpacing: 8, children: [
+                      ChoiceChip(
+                          label: Text('الكل (${groups.length})'),
+                          selected: _cat == null,
+                          onSelected: (_) => _setCat(null)),
+                      for (final c in _cats)
+                        ChoiceChip(
+                            label: Text(
+                                '$c (${groups.where((g) => inCat(g, c)).length})'),
+                            selected: _cat != null &&
+                                _cat != kNoCat &&
+                                _nz(_cat!) == _nz(c),
+                            onSelected: (_) => _setCat(c)),
+                      if (groups.any((g) => g.cats.isEmpty && !Wa.inAnyWaCat(g)))
+                        ChoiceChip(
+                            label: Text(
+                                'بدون تصنيف (${groups.where((g) => inCat(g, kNoCat)).length})'),
+                            selected: _cat == kNoCat,
+                            onSelected: (_) => _setCat(kNoCat)),
+                    ]),
+                  ]),
+            ),
+          ),
+        ],
         if (job != null) ...[
           const SizedBox(height: 8),
           Card(
