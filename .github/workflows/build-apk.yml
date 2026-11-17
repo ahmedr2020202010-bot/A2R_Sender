@@ -398,7 +398,14 @@ jobs:
 
       - run: flutter pub get
       - run: flutter build apk --release
+      - name: Upload APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: A2R-Sender-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 30
       - name: Publish release with the APK
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -411,6 +418,7 @@ jobs:
             --notes "APK build #${{ github.run_number }}"
 
       - name: Keep only the latest 5 releases
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
