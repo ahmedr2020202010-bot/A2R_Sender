@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -759,6 +760,287 @@ Future<bool> ask(BuildContext c, String title, String body,
   return r ?? false;
 }
 
+// ======================= أسماء الجروبات من واتساب =======================
+class Wa {
+  static List<String> get names =>
+      ((Store.data['wa'] as List?) ?? const []).map((e) => e.toString()).toList();
+  static Map<String, String> get map {
+    final m = Store.data['wamap'];
+    if (m is Map) {
+      return m.map((k, v) => MapEntry(k.toString(), v.toString()));
+    }
+    return <String, String>{};
+  }
+}
+
+String _nz(String s) {
+  var t = _clean(s).toLowerCase();
+  t = t.replaceAll(RegExp(r'[\u064b-\u065f\u0670\u0640]'), '');
+  t = t
+      .replaceAll(RegExp(r'[أإآ]'), 'ا')
+      .replaceAll('ى', 'ي')
+      .replaceAll('ة', 'ه');
+  return t;
+}
+
+List<String> _toks(String s) => RegExp(r'\p{L}+|\p{N}+', unicode: true)
+    .allMatches(_nz(s))
+    .map((m) => m.group(0)!)
+    .toList();
+
+/// يطابق صف الشيت مع أقرب اسم جروب في واتساب. يرجع null لو لا يوجد تطابق واضح.
+String? autoMatch(G g, List<String> wa) {
+  if (wa.isEmpty) return null;
+  final st = <String>[
+    ..._toks(g.name),
+    ...g.numbers.split('/').where((e) => e.isNotEmpty),
+  ];
+  if (st.isEmpty) return null;
+  String? best;
+  var b1 = 0.0, b2 = 0.0;
+  for (final w in wa) {
+    final wt = _toks(w).toSet();
+    if (wt.isEmpty) continue;
+    final hits = st.where((x) => wt.contains(x)).length;
+    final extra = wt.length - hits;
+    final sc = hits / st.length - 0.02 * (extra < 0 ? 0 : extra);
+    if (sc > b1) {
+      b2 = b1;
+      b1 = sc;
+      best = w;
+    } else if (sc > b2) {
+      b2 = sc;
+    }
+  }
+  if (best == null || b1 < 0.6) return null;
+  if (b2 > b1 - 0.15) return null; // أكثر من احتمال: يُترك للاختيار اليدوي
+  return best;
+}
+
+/// الكلمة التي تُنسخ وتُلصق في بحث واتساب: الاختيار اليدوي ثم المطابقة التلقائية ثم الرقم/الاسم القديم.
+String waKey(G g) {
+  final m = Store.data['wamap'];
+  if (m is Map && m[g.key] is String && (m[g.key] as String).isNotEmpty) {
+    return m[g.key] as String;
+  }
+  return autoMatch(g, Wa.names) ?? g.searchKey;
+}
+
+class WaGroupsScreen extends StatefulWidget {
+  final List<G> groups;
+  const WaGroupsScreen({super.key, required this.groups});
+  @override
+  State<WaGroupsScreen> createState() => _WaGroupsScreenState();
+}
+
+class _WaGroupsScreenState extends State<WaGroupsScreen>
+    with WidgetsBindingObserver {
+  bool enabled = false, started = false, fallback = false;
+  int count = 0;
+  Timer? timer;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _poll();
+  }
+
+  @override
+  void dispose() {
+    timer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState s) {
+    if (s == AppLifecycleState.resumed) _poll();
+  }
+
+  Future<void> _poll() async {
+    try {
+      final en = await _ch.invokeMethod<bool>('accEnabled') ?? false;
+      final raw = await _ch.invokeMethod<Map>('scanStatus');
+      final st = Map<String, dynamic>.from(raw ?? <dynamic, dynamic>{});
+      if (started && st['done'] == true) {
+        final l = await _ch.invokeMethod<List>('scanNames') ?? <dynamic>[];
+        Store.data['wa'] = l.map((e) => e.toString()).toList();
+        Store.data['waFallback'] = st['fallback'] == true;
+        await Store.save();
+        started = false;
+        timer?.cancel();
+      }
+      if (!mounted) return;
+      setState(() {
+        enabled = en;
+        count = (st['count'] as int?) ?? 0;
+        fallback = st['fallback'] == true;
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _start() async {
+    try {
+      await _ch.invokeMethod<bool>('startScan');
+      started = true;
+      timer?.cancel();
+      timer = Timer.periodic(const Duration(seconds: 1), (_) => _poll());
+      if (mounted) {
+        snack(context, 'جاري السحب من واتساب… لا تلمسي الشاشة حتى يرجع التطبيق');
+      }
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+      snack(
+          context,
+          e.code == 'NO_SERVICE'
+              ? 'فعّلي خدمة A2R Sender من إعدادات إمكانية الوصول أولاً'
+              : e.code == 'NO_WA_BUSINESS'
+                  ? 'WhatsApp Business غير مثبت'
+                  : 'تعذر البدء: ${e.message}');
+    }
+  }
+
+  Future<void> _pick(G g) async {
+    final r = await showDialog<String>(
+        context: context,
+        builder: (_) => _PickDialog(title: g.title, names: Wa.names));
+    if (r == null) return;
+    final m = Wa.map;
+    if (r.isEmpty) {
+      m.remove(g.key);
+    } else {
+      m[g.key] = r;
+    }
+    Store.data['wamap'] = m;
+    await Store.save();
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final names = Wa.names;
+    final map = Wa.map;
+    var ok = 0;
+    final rows = <Widget>[];
+    for (final g in widget.groups) {
+      final manual = map[g.key];
+      final auto = manual == null ? autoMatch(g, names) : null;
+      final shown = manual ?? auto;
+      if (shown != null) ok++;
+      rows.add(ListTile(
+        title: Text(g.title),
+        subtitle: Text(
+          shown ??
+              (names.isEmpty
+                  ? 'لم يتم السحب بعد'
+                  : 'لا يوجد تطابق واضح — اضغطي للاختيار'),
+          style: shown == null ? const TextStyle(color: Colors.red) : null,
+        ),
+        trailing: Icon(
+          manual != null
+              ? Icons.edit
+              : auto != null
+                  ? Icons.check_circle
+                  : Icons.help_outline,
+          color: shown == null ? Colors.red : Colors.green,
+        ),
+        onTap: () => _pick(g),
+      ));
+    }
+    return Scaffold(
+      appBar: AppBar(title: const Text('أسماء الجروبات من واتساب')),
+      body: ListView(padding: const EdgeInsets.all(16), children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(enabled
+                  ? 'خدمة إمكانية الوصول: مفعّلة ✓'
+                  : 'خدمة إمكانية الوصول: غير مفعّلة'),
+              if (!enabled) ...[
+                const SizedBox(height: 6),
+                const Text(
+                    'افتحي الإعدادات ← إمكانية الوصول ← التطبيقات المثبّتة ← A2R Sender ← تشغيل.\n'
+                    'لو الخيار رمادي: إعدادات الهاتف ← التطبيقات ← A2R Sender ← النقاط الثلاث ← السماح بالإعدادات المقيّدة.'),
+                const SizedBox(height: 8),
+                OutlinedButton(
+                    onPressed: () => _ch.invokeMethod<bool>('openAccSettings'),
+                    child: const Text('فتح إعدادات إمكانية الوصول')),
+              ],
+              const SizedBox(height: 8),
+              Text(started
+                  ? 'جاري السحب… تم العثور على $count اسم'
+                  : 'الأسماء المحفوظة من واتساب: ${names.length}'),
+              if (Store.data['waFallback'] == true || fallback)
+                const Text(
+                    'تنبيه: لم أستطع تمييز أسماء المحادثات بدقة، قد تظهر نصوص زائدة في القائمة.'),
+            ]),
+          ),
+        ),
+        const SizedBox(height: 8),
+        FilledButton.icon(
+          onPressed: (enabled && !started) ? _start : null,
+          icon: const Icon(Icons.cloud_download),
+          label: const Text('سحب الأسماء من واتساب'),
+        ),
+        const SizedBox(height: 8),
+        if (names.isNotEmpty)
+          Text('تمت مطابقة $ok من ${widget.groups.length} جروب',
+              style: Theme.of(context).textTheme.titleMedium),
+        ...rows,
+      ]),
+    );
+  }
+}
+
+class _PickDialog extends StatefulWidget {
+  final String title;
+  final List<String> names;
+  const _PickDialog({required this.title, required this.names});
+  @override
+  State<_PickDialog> createState() => _PickDialogState();
+}
+
+class _PickDialogState extends State<_PickDialog> {
+  String q = '';
+  @override
+  Widget build(BuildContext context) {
+    final nq = _nz(q);
+    final list = widget.names
+        .where((n) => nq.isEmpty || _nz(n).contains(nq))
+        .toList();
+    return AlertDialog(
+      title: Text(widget.title),
+      content: SizedBox(
+        width: double.maxFinite,
+        height: 420,
+        child: Column(children: [
+          TextField(
+              decoration: const InputDecoration(
+                  hintText: 'بحث', prefixIcon: Icon(Icons.search)),
+              onChanged: (v) => setState(() => q = v)),
+          Expanded(
+              child: ListView.builder(
+                  itemCount: list.length,
+                  itemBuilder: (_, i) => ListTile(
+                      dense: true,
+                      title: Text(list[i]),
+                      onTap: () => Navigator.pop(context, list[i])))),
+        ]),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context, ''),
+            child: const Text('إلغاء الربط')),
+        TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('إغلاق')),
+      ],
+    );
+  }
+}
+
 // ======================= التطبيق =======================
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -943,6 +1225,13 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
     return Scaffold(
       appBar: AppBar(title: const Text('A2R Sender'), actions: [
         IconButton(
+            tooltip: 'أسماء الجروبات من واتساب',
+            onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                    builder: (_) => WaGroupsScreen(groups: groups))),
+            icon: const Icon(Icons.groups)),
+        IconButton(
             tooltip: 'تحديث من ملف Excel',
             onPressed: _reload,
             icon: const Icon(Icons.refresh)),
@@ -1092,7 +1381,7 @@ class _SendScreenState extends State<SendScreen> {
         return;
       }
     }
-    await Clipboard.setData(ClipboardData(text: _g(i).searchKey));
+    await Clipboard.setData(ClipboardData(text: waKey(_g(i))));
     try {
       await _ch.invokeMethod<bool>(
           'share', {'text': job['text'] as String, 'paths': media});
@@ -1230,14 +1519,14 @@ class _SendScreenState extends State<SendScreen> {
                     const Divider(height: 24),
                     Row(children: [
                       Expanded(
-                          child: Text('ابحثي في واتساب عن:  ${_g(i).searchKey}',
+                          child: Text('ابحثي في واتساب عن:  ${waKey(_g(i))}',
                               style: t.textTheme.titleMedium)),
                       IconButton(
                         tooltip: 'نسخ',
                         icon: const Icon(Icons.copy),
                         onPressed: () async {
                           await Clipboard.setData(
-                              ClipboardData(text: _g(i).searchKey));
+                              ClipboardData(text: waKey(_g(i))));
                           if (context.mounted) snack(context, 'تم النسخ');
                         },
                       ),
