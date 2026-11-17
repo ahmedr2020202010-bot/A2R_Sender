@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -30,6 +33,8 @@ jobs:
             file_picker: ^8.0.7
             permission_handler: ^11.3.1
             excel: 4.0.3
+          dependency_overrides:
+            archive: ^3.6.1
           flutter:
             uses-material-design: true
           YAML
@@ -157,7 +162,25 @@ jobs:
 
       - run: flutter pub get
       - run: flutter build apk --release
-      - uses: actions/upload-artifact@v4
-        with:
-          name: a2r-academy-sender-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+      - name: Publish release with the APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="build-${{ github.run_number }}"
+          cp build/app/outputs/flutter-apk/app-release.apk "A2R-Sender-$TAG.apk"
+          gh release create "$TAG" "A2R-Sender-$TAG.apk" \
+            --target "${{ github.sha }}" \
+            --title "A2R Sender #${{ github.run_number }}" \
+            --notes "APK build #${{ github.run_number }}"
+
+      - name: Keep only the latest 5 releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release list --limit 100 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[5:] | .[].tagName' |
+          while read -r t; do
+            gh release delete "$t" --cleanup-tag --yes
+          done
