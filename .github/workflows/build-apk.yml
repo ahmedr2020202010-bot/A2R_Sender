@@ -61,6 +61,7 @@ jobs:
           import android.content.ActivityNotFoundException
           import android.content.Intent
           import android.net.Uri
+          import android.provider.Settings
           import androidx.core.content.FileProvider
           import io.flutter.embedding.android.FlutterActivity
           import io.flutter.embedding.engine.FlutterEngine
@@ -74,15 +75,48 @@ jobs:
                   super.configureFlutterEngine(flutterEngine)
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "a2r/share")
                       .setMethodCallHandler { call, result ->
-                          if (call.method != "share") {
-                              result.notImplemented()
-                              return@setMethodCallHandler
-                          }
                           try {
-                              val text = call.argument<String>("text") ?: ""
-                              val paths = call.argument<List<String>>("paths") ?: emptyList()
-                              share(text, paths)
-                              result.success(true)
+                              when (call.method) {
+                                  "share" -> {
+                                      val text = call.argument<String>("text") ?: ""
+                                      val paths = call.argument<List<String>>("paths") ?: emptyList()
+                                      share(text, paths)
+                                      result.success(true)
+                                  }
+                                  "accEnabled" -> result.success(WaScanService.instance != null)
+                                  "openAccSettings" -> {
+                                      val i = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                      startActivity(i)
+                                      result.success(true)
+                                  }
+                                  "startScan" -> {
+                                      val svc = WaScanService.instance
+                                      if (svc == null) {
+                                          result.error("NO_SERVICE", "الخدمة غير مفعلة", null)
+                                      } else {
+                                          WaScan.reset()
+                                          WaScan.active = true
+                                          share(".", emptyList())
+                                          svc.begin()
+                                          result.success(true)
+                                      }
+                                  }
+                                  "scanStatus" -> result.success(
+                                      hashMapOf<String, Any>(
+                                          "active" to WaScan.active,
+                                          "done" to WaScan.done,
+                                          "count" to WaScan.size(),
+                                          "fallback" to WaScan.usedFallback
+                                      )
+                                  )
+                                  "scanNames" -> result.success(WaScan.snapshot())
+                                  "stopScan" -> {
+                                      WaScan.active = false
+                                      result.success(true)
+                                  }
+                                  else -> result.notImplemented()
+                              }
                           } catch (e: ActivityNotFoundException) {
                               result.error("NO_WA_BUSINESS", "WhatsApp Business غير مثبت", null)
                           } catch (e: Exception) {
@@ -133,6 +167,161 @@ jobs:
               }
           }
           KT
+          cat > $D/WaScanService.kt <<'KT'
+          package com.a2r.a2r_academy_sender
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Intent
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          object WaScan {
+              @Volatile var active = false
+              @Volatile var done = false
+              @Volatile var usedFallback = false
+              private val names = LinkedHashSet<String>()
+
+              fun reset() {
+                  synchronized(names) { names.clear() }
+                  active = false
+                  done = false
+                  usedFallback = false
+              }
+
+              fun add(list: List<String>) {
+                  synchronized(names) { names.addAll(list) }
+              }
+
+              fun size(): Int = synchronized(names) { names.size }
+
+              fun snapshot(): ArrayList<String> = synchronized(names) { ArrayList(names) }
+          }
+
+          class WaScanService : AccessibilityService() {
+              companion object {
+                  @Volatile var instance: WaScanService? = null
+              }
+
+              private val pkg = "com.whatsapp.w4b"
+              private val handler = Handler(Looper.getMainLooper())
+              private var stale = 0
+              private var away = 0
+              private var ticking = false
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  instance = this
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+              override fun onInterrupt() {}
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+
+              fun begin() {
+                  stale = 0
+                  away = 0
+                  if (!ticking) {
+                      ticking = true
+                      handler.postDelayed({ step() }, 1500)
+                  }
+              }
+
+              private fun walk(n: AccessibilityNodeInfo?, out: MutableList<Pair<String, String>>) {
+                  if (n == null) return
+                  val t = n.text?.toString()?.trim()
+                  if (!t.isNullOrEmpty()) out.add((n.viewIdResourceName ?: "") to t)
+                  for (i in 0 until n.childCount) walk(n.getChild(i), out)
+              }
+
+              private fun findScrollable(n: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+                  if (n == null) return null
+                  if (n.isScrollable) return n
+                  for (i in 0 until n.childCount) {
+                      val r = findScrollable(n.getChild(i))
+                      if (r != null) return r
+                  }
+                  return null
+              }
+
+              private fun step() {
+                  if (!WaScan.active) {
+                      ticking = false
+                      return
+                  }
+                  val root = rootInActiveWindow
+                  if (root == null || root.packageName?.toString() != pkg) {
+                      away++
+                      if (away > 25) {
+                          finish()
+                          return
+                      }
+                      handler.postDelayed({ step() }, 700)
+                      return
+                  }
+                  away = 0
+                  val before = WaScan.size()
+                  val all = ArrayList<Pair<String, String>>()
+                  walk(root, all)
+                  val byId = all.filter {
+                      it.first.endsWith("row_name") || it.first.endsWith("contact_name")
+                  }
+                  val picked = if (byId.isNotEmpty()) {
+                      byId
+                  } else {
+                      WaScan.usedFallback = true
+                      all.filter { it.second.length in 2..80 }
+                  }
+                  WaScan.add(picked.map { it.second })
+                  val scroller = findScrollable(root)
+                  val scrolled = scroller?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) ?: false
+                  if (WaScan.size() == before) stale++ else stale = 0
+                  if (stale >= 3 || (scroller != null && !scrolled)) {
+                      finish()
+                      return
+                  }
+                  handler.postDelayed({ step() }, 900)
+              }
+
+              private fun finish() {
+                  WaScan.active = false
+                  WaScan.done = true
+                  ticking = false
+                  try {
+                      val i = packageManager.getLaunchIntentForPackage(packageName)
+                      if (i != null) {
+                          i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                          startActivity(i)
+                      }
+                  } catch (_: Exception) {
+                  }
+              }
+          }
+          KT
+          cat > android/app/src/main/res/xml/a2r_accessibility.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="200"
+              android:packageNames="com.whatsapp.w4b"
+              android:description="@string/a2r_acc_desc" />
+          XML
+          mkdir -p android/app/src/main/res/values
+          cat > android/app/src/main/res/values/a2r_strings.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="a2r_acc_desc">يقرأ أسماء المحادثات والجروبات من WhatsApp Business فقط لمطابقتها مع ملف Excel. لا يرسل أي بيانات خارج الهاتف.</string>
+          </resources>
+          XML
           cat > android/app/src/main/res/xml/file_paths.xml <<'XML'
           <?xml version="1.0" encoding="utf-8"?>
           <paths>
@@ -154,6 +343,15 @@ jobs:
               '            <meta-data android:name="android.support.FILE_PROVIDER_PATHS"\n'
               '                android:resource="@xml/file_paths"/>\n'
               '        </provider>\n'
+              '        <service android:name=".WaScanService" android:exported="true"\n'
+              '            android:label="A2R Sender"\n'
+              '            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">\n'
+              '            <intent-filter>\n'
+              '                <action android:name="android.accessibilityservice.AccessibilityService"/>\n'
+              '            </intent-filter>\n'
+              '            <meta-data android:name="android.accessibilityservice"\n'
+              '                android:resource="@xml/a2r_accessibility"/>\n'
+              '        </service>\n'
           )
           s = s.replace('<application', perms + '    <application android:requestLegacyExternalStorage="true"', 1)
           s = s.replace('</application>', provider + '    </application>', 1)
