@@ -1064,7 +1064,7 @@ class SendScreen extends StatefulWidget {
 
 class _SendScreenState extends State<SendScreen> {
   late Map<String, dynamic> job;
-  int? override;
+  int? forced;
   bool opened = false;
 
   @override
@@ -1079,7 +1079,7 @@ class _SendScreenState extends State<SendScreen> {
   int _count(String s) => _st.where((x) => x == s).length;
 
   int? get cur {
-    if (override != null) return override;
+    if (forced != null) return forced;
     final i = _st.indexOf('pending');
     return i < 0 ? null : i;
   }
@@ -1111,7 +1111,7 @@ class _SendScreenState extends State<SendScreen> {
     _st[i] = s;
     await Store.save();
     setState(() {
-      override = null;
+      forced = null;
       opened = false;
     });
   }
@@ -1125,7 +1125,7 @@ class _SendScreenState extends State<SendScreen> {
       _st[i] = 'pending';
       await Store.save();
     }
-    if (mounted) setState(() => override = i);
+    if (mounted) setState(() => forced = i);
   }
 
   Future<void> _finish() async {
