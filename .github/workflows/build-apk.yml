@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   build:
@@ -398,13 +399,8 @@ jobs:
 
       - run: flutter pub get
       - run: flutter build apk --release
-      - name: Upload APK as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: A2R-Sender-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
-          retention-days: 30
       - name: Publish release with the APK
+        id: rel
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -418,6 +414,7 @@ jobs:
             --notes "APK build #${{ github.run_number }}"
 
       - name: Keep only the latest 5 releases
+        if: steps.rel.outcome == 'success'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -428,3 +425,29 @@ jobs:
           while read -r t; do
             gh release delete "$t" --cleanup-tag --yes
           done
+
+      - name: Delete old artifacts (free storage quota)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh api --paginate "repos/$GH_REPO/actions/artifacts?per_page=100" --jq '.artifacts[].id' |
+          while read -r id; do
+            gh api -X DELETE "repos/$GH_REPO/actions/artifacts/$id" || true
+          done
+
+      - name: Upload APK as artifact
+        id: art
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: A2R-Sender-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 7
+
+      - name: Verify the APK was delivered
+        if: steps.rel.outcome != 'success' && steps.art.outcome != 'success'
+        run: |
+          echo "::error::APK built but neither the Release nor the Artifact upload worked. Check Settings > Actions > General > Workflow permissions (Read and write) and the Artifacts storage quota."
+          exit 1
