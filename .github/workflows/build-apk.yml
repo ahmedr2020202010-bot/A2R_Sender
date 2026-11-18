@@ -176,13 +176,24 @@ jobs:
           restore-keys: |
             gradle-${{ runner.os }}-
 
+      - name: Disable Android lintVital tasks (lint crashes with NoSuchMethodError on JDK 17)
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/no-lint-vital.gradle <<'EOF'
+          allprojects {
+            tasks.configureEach { t ->
+              if (t.name.startsWith('lintVital')) { t.enabled = false }
+            }
+          }
+          EOF
+
       - run: flutter pub get
       - name: Build APK (retries on Maven 429 / network errors)
         run: |
-          for i in 1 2 3 4; do
+          for i in 1 2 3; do
             if flutter build apk --release; then exit 0; fi
             echo "Build attempt $i failed; waiting before retry..."
-            sleep $((i * 60))
+            sleep $((i * 30))
           done
           exit 1
       - name: Publish release with the APK
