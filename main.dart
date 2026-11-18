@@ -18,16 +18,21 @@ const MethodChannel _ch = MethodChannel('a2r/share');
 
 const Map<String, String> kKinds = {
   'text': 'نص فقط',
+  'image': 'صورة فقط',
   'imageText': 'صورة مع نص',
-  'sticker1': 'استيكر واحد',
-  'sticker2': 'استيكران',
+  'stickers': 'استيكر أو أكثر',
 };
+// أقصى عدد ملفات في الرسالة (واتساب يقبل حتى 30). الاستيكرات: واحد أو أكثر بدون عدد محدد.
 const Map<String, int> kLimit = {
   'text': 0,
+  'image': 1,
   'imageText': 1,
-  'sticker1': 1,
-  'sticker2': 2,
+  'stickers': 30,
 };
+
+/// اسم نوع الرسالة (يدعم المهام القديمة sticker1/sticker2).
+String kindName(String k) =>
+    kKinds[k] ?? (k.startsWith('sticker') ? 'استيكر' : k);
 
 // ======================= الجروبات وملف Excel =======================
 // البيانات الأولية: تُكتب في groups.xlsx أول مرة فقط (الاسم|المعلمة). بعدها عدّلي الملف نفسه في الهاتف.
@@ -656,8 +661,16 @@ G? parseRow(List<String> c) {
   if (raw.isEmpty) return null;
   if (c.length > 3 && _clean(c[3]).isNotEmpty) return null; // موقوف
   var name = raw, nums = '';
-  final m = _tail.firstMatch(raw);
-  if (m != null && m.group(1)!.trim().isNotEmpty) {
+  // كود بصيغة PTN-001325: الرقم للبحث = 1325 (بدون PTN وبدون الأصفار)، والباقي هو الاسم.
+  final ptn = RegExp(r'PTN\s*[-_]?\s*0*(\d+)', caseSensitive: false);
+  final pm = ptn.allMatches(raw).toList();
+  final m = pm.isEmpty ? _tail.firstMatch(raw) : null;
+  if (pm.isNotEmpty) {
+    nums = pm.map((e) => e.group(1)!).join('/');
+    final rest = _clean(raw.replaceAll(ptn, ' '))
+        .replaceAll(RegExp(r'^[\s/\-_,،]+|[\s/\-_,،]+$'), '');
+    if (rest.isNotEmpty) name = rest;
+  } else if (m != null && m.group(1)!.trim().isNotEmpty) {
     name = m.group(1)!.trim();
     nums = m
         .group(2)!
@@ -681,8 +694,20 @@ G? parseRow(List<String> c) {
   final seen = <String>{};
   final out = <G>[];
   var dups = 0, off = 0;
-  for (var i = 0; i < rows.length; i++) {
-    final r = rows[i];
+  // تصدير المواعيد (صف عناوين فيه "الكود" و"مدرس"): الاسم والكود في الأول، والمعلم من عمود "مدرس".
+  var start = 0, tcol = -1;
+  for (var i = 0; i < rows.length && i < 5; i++) {
+    if (rows[i].isNotEmpty && _clean(rows[i][0]) == 'الكود') {
+      start = i + 1;
+      tcol = rows[i].indexWhere((e) => _clean(e) == 'مدرس');
+      break;
+    }
+  }
+  for (var i = start; i < rows.length; i++) {
+    var r = rows[i];
+    if (start > 0) {
+      r = [r.isEmpty ? '' : r[0], (tcol >= 0 && tcol < r.length) ? r[tcol] : ''];
+    }
     if (i == 0 && r.isNotEmpty && r[0].contains('العميل')) continue;
     final g = parseRow(r);
     if (g == null) {
@@ -940,123 +965,79 @@ class WaGroupsScreen extends StatefulWidget {
   State<WaGroupsScreen> createState() => _WaGroupsScreenState();
 }
 
-class _WaGroupsScreenState extends State<WaGroupsScreen>
-    with WidgetsBindingObserver {
-  bool enabled = false, started = false, fallback = false;
-  int count = 0;
-  String? scanCat; // اسم التصنيف أثناء السحب من شاشة واتساب المفتوحة
-  Timer? timer;
-
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addObserver(this);
-    _poll();
-  }
-
-  @override
-  void dispose() {
-    timer?.cancel();
-    WidgetsBinding.instance.removeObserver(this);
-    super.dispose();
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState s) {
-    if (s == AppLifecycleState.resumed) _poll();
-  }
-
-  Future<void> _poll() async {
-    try {
-      final en = await _ch.invokeMethod<bool>('accEnabled') ?? false;
-      final raw = await _ch.invokeMethod<Map>('scanStatus');
-      final st = Map<String, dynamic>.from(raw ?? <dynamic, dynamic>{});
-      if (started && st['done'] == true) {
-        final l = await _ch.invokeMethod<List>('scanNames') ?? <dynamic>[];
-        final got = l.map((e) => e.toString()).toList();
-        if (scanCat != null) {
-          final cm = Wa.cats;
-          cm[scanCat!] = got;
-          Store.data['wacats'] = cm;
-          final all = <String>{...Wa.names, ...got};
-          Store.data['wa'] = all.toList();
-        } else {
-          Store.data['wa'] = got;
-        }
-        scanCat = null;
-        Wa.invalidate();
-        Store.data['waFallback'] = st['fallback'] == true;
-        await Store.save();
-        started = false;
-        timer?.cancel();
-      }
-      if (!mounted) return;
-      setState(() {
-        enabled = en;
-        count = (st['count'] as int?) ?? 0;
-        fallback = st['fallback'] == true;
-      });
-    } catch (_) {}
-  }
-
-  Future<String?> _askCat() async {
-    final c = TextEditingController();
-    final r = await showDialog<String>(
+class _WaGroupsScreenState extends State<WaGroupsScreen> {
+  /// لصق أسماء الجروبات (سطر لكل اسم) بدل السحب التلقائي.
+  Future<void> _addNames() async {
+    final namesC = TextEditingController();
+    final catC = TextEditingController();
+    final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('اسم التصنيف'),
-        content: Column(mainAxisSize: MainAxisSize.min, children: [
-          const Text(
-              'افتحي WhatsApp Business الآن على التصنيف/القائمة المطلوبة بحيث تظهر جروباتها فقط، ثم اكتبي اسمه هنا.'),
-          const SizedBox(height: 8),
-          TextField(
-              controller: c,
-              decoration: const InputDecoration(hintText: 'مثال: السبت')),
-          const SizedBox(height: 8),
-          Wrap(spacing: 6, children: [
-            for (final d in kDays)
-              ActionChip(label: Text(d), onPressed: () => c.text = d),
+        title: const Text('إضافة أسماء الجروبات'),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Text(
+                'انسخي أسماء الجروبات من واتساب والصقيها هنا، كل اسم في سطر.'),
+            const SizedBox(height: 8),
+            TextField(
+              controller: namesC,
+              minLines: 6,
+              maxLines: 12,
+              decoration: const InputDecoration(
+                  border: OutlineInputBorder(), hintText: 'اسم الجروب\nاسم الجروب'),
+            ),
+            const SizedBox(height: 12),
+            const Text('اختياري: اسم التصنيف (مثل اليوم) لحفظ الأسماء تحته'),
+            const SizedBox(height: 6),
+            TextField(
+                controller: catC,
+                decoration: const InputDecoration(hintText: 'مثال: السبت')),
+            const SizedBox(height: 8),
+            Wrap(spacing: 6, children: [
+              for (final d in kDays)
+                ActionChip(label: Text(d), onPressed: () => catC.text = d),
+            ]),
           ]),
-        ]),
+        ),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('إلغاء')),
           FilledButton(
-              onPressed: () => Navigator.pop(ctx, c.text.trim()),
-              child: const Text('ابدأ السحب')),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('حفظ')),
         ],
       ),
     );
-    return (r == null || r.isEmpty) ? null : r;
-  }
-
-  Future<void> _startScreen() async {
-    final c = await _askCat();
-    if (c == null) return;
-    await _start(cat: c);
-  }
-
-  Future<void> _start({String? cat}) async {
-    try {
-      scanCat = cat;
-      await _ch.invokeMethod<bool>('startScan', {'screen': cat != null});
-      started = true;
-      timer?.cancel();
-      timer = Timer.periodic(const Duration(seconds: 1), (_) => _poll());
-      if (mounted) {
-        snack(context, 'جاري السحب من واتساب… لا تلمسي الشاشة حتى يرجع التطبيق');
-      }
-    } on PlatformException catch (e) {
-      scanCat = null;
-      if (!mounted) return;
-      snack(
-          context,
-          e.code == 'NO_SERVICE'
-              ? 'فعّلي خدمة A2R Sender من إعدادات إمكانية الوصول أولاً'
-              : e.code == 'NO_WA_BUSINESS'
-                  ? 'WhatsApp Business غير مثبت'
-                  : 'تعذر البدء: ${e.message}');
+    if (ok != true) return;
+    final got = namesC.text
+        .split(RegExp(r'[\r\n]+'))
+        .map((e) => e.trim())
+        .where((e) => e.isNotEmpty)
+        .toSet()
+        .toList();
+    if (got.isEmpty) return;
+    final cat = catC.text.trim();
+    if (cat.isNotEmpty) {
+      final cm = Wa.cats;
+      cm[cat] = got;
+      Store.data['wacats'] = cm;
     }
+    Store.data['wa'] = <String>{...Wa.names, ...got}.toList();
+    Wa.invalidate();
+    await Store.save();
+    if (mounted) {
+      setState(() {});
+      snack(context, 'تمت إضافة ${got.length} اسم');
+    }
+  }
+
+  Future<void> _clearAll() async {
+    Store.data['wa'] = <String>[];
+    Store.data['wacats'] = <String, dynamic>{};
+    Wa.invalidate();
+    await Store.save();
+    if (mounted) setState(() {});
   }
 
   Future<void> _pick(G g) async {
@@ -1091,7 +1072,7 @@ class _WaGroupsScreenState extends State<WaGroupsScreen>
         subtitle: Text(
           shown ??
               (names.isEmpty
-                  ? 'لم يتم السحب بعد'
+                  ? 'لم تتم إضافة أسماء بعد'
                   : 'لا يوجد تطابق واضح — اضغطي للاختيار'),
           style: shown == null ? const TextStyle(color: Colors.red) : null,
         ),
@@ -1112,42 +1093,23 @@ class _WaGroupsScreenState extends State<WaGroupsScreen>
         Card(
           child: Padding(
             padding: const EdgeInsets.all(12),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(enabled
-                  ? 'خدمة إمكانية الوصول: مفعّلة ✓'
-                  : 'خدمة إمكانية الوصول: غير مفعّلة'),
-              if (!enabled) ...[
-                const SizedBox(height: 6),
-                const Text(
-                    'افتحي الإعدادات ← إمكانية الوصول ← التطبيقات المثبّتة ← A2R Sender ← تشغيل.\n'
-                    'لو الخيار رمادي: إعدادات الهاتف ← التطبيقات ← A2R Sender ← النقاط الثلاث ← السماح بالإعدادات المقيّدة.'),
-                const SizedBox(height: 8),
-                OutlinedButton(
-                    onPressed: () => _ch.invokeMethod<bool>('openAccSettings'),
-                    child: const Text('فتح إعدادات إمكانية الوصول')),
-              ],
-              const SizedBox(height: 8),
-              Text(started
-                  ? 'جاري السحب… تم العثور على $count اسم'
-                  : 'الأسماء المحفوظة من واتساب: ${names.length}'),
-              if (Store.data['waFallback'] == true || fallback)
-                const Text(
-                    'تنبيه: لم أستطع تمييز أسماء المحادثات بدقة، قد تظهر نصوص زائدة في القائمة.'),
-            ]),
+            child: Text('الأسماء المحفوظة من واتساب: ${names.length}'),
           ),
         ),
         const SizedBox(height: 8),
         FilledButton.icon(
-          onPressed: (enabled && !started) ? _startScreen : null,
-          icon: const Icon(Icons.label),
-          label: const Text('سحب تصنيف: من الشاشة المفتوحة في واتساب'),
+          onPressed: _addNames,
+          icon: const Icon(Icons.paste),
+          label: const Text('لصق / إضافة أسماء الجروبات'),
         ),
-        const SizedBox(height: 8),
-        OutlinedButton.icon(
-          onPressed: (enabled && !started) ? () => _start() : null,
-          icon: const Icon(Icons.cloud_download),
-          label: const Text('سحب كل الأسماء (من شاشة المشاركة)'),
-        ),
+        if (names.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            onPressed: _clearAll,
+            icon: const Icon(Icons.delete_sweep),
+            label: const Text('مسح كل الأسماء المحفوظة'),
+          ),
+        ],
         if (Wa.cats.isNotEmpty) ...[
           const SizedBox(height: 8),
           Text('التصنيفات المسحوبة', style: Theme.of(context).textTheme.titleMedium),
@@ -1322,6 +1284,7 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
     final d = Store.data['draft'];
     if (d is Map<String, dynamic>) {
       kind = (d['kind'] as String?) ?? 'text';
+      if (kind == 'sticker1' || kind == 'sticker2') kind = 'stickers';
       if (!kKinds.containsKey(kind)) kind = 'text';
       text.text = (d['text'] as String?) ?? '';
       media = ((d['media'] as List?) ?? const [])
@@ -1356,6 +1319,35 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
     });
   }
 
+  /// استيراد ملف Excel من أي مكان في الهاتف ونسخه مكان groups.xlsx.
+  Future<void> _importExcel() async {
+    try {
+      final res = await FilePicker.platform.pickFiles(
+          type: FileType.custom, allowedExtensions: ['xlsx']);
+      if (res == null || res.files.isEmpty || res.files.first.path == null) {
+        return;
+      }
+      final src = File(res.files.first.path!);
+      final r = parseSheet(readRows(src.path)); // تحقق إن الملف سليم
+      if (r.groups.isEmpty) {
+        if (mounted) snack(context, 'لا توجد جروبات في هذا الملف');
+        return;
+      }
+      final e = await prepareFolder();
+      if (e != null) {
+        if (mounted) snack(context, e);
+        return;
+      }
+      final dst = File(kFile);
+      if (dst.existsSync()) dst.deleteSync();
+      await src.copy(kFile);
+      await _reload();
+      if (mounted) snack(context, 'تم استيراد ${r.groups.length} جروب');
+    } catch (x) {
+      if (mounted) snack(context, 'تعذر استيراد الملف: $x');
+    }
+  }
+
   void _saveDraft() {
     Store.data['draft'] = {'kind': kind, 'text': text.text, 'media': media};
     Store.save();
@@ -1363,6 +1355,8 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
 
   void _setKind(String k) {
     setState(() {
+      // الاستيكرات والصور لا تُخلط: عند التبديل بينهما تُفرّغ القائمة.
+      if ((k == 'stickers') != (kind == 'stickers')) media = [];
       kind = k;
       final lim = kLimit[k]!;
       if (media.length > lim) media = media.sublist(0, lim);
@@ -1373,8 +1367,14 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
   Future<void> _pick() async {
     final room = kLimit[kind]! - media.length;
     if (room <= 0) return;
-    final res = await FilePicker.platform
-        .pickFiles(type: FileType.image, allowMultiple: room > 1);
+    // الاستيكرات ملفات .webp: تُختار من مدير الملفات وليس من معرض الصور.
+    final res = kind == 'stickers'
+        ? await FilePicker.platform.pickFiles(
+            type: FileType.custom,
+            allowedExtensions: ['webp'],
+            allowMultiple: true)
+        : await FilePicker.platform
+            .pickFiles(type: FileType.image, allowMultiple: room > 1);
     if (res == null) return;
     for (final f in res.files.take(room)) {
       if (f.path != null) media.add(await persistMedia(f.path!));
@@ -1386,9 +1386,8 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
 
   String? _validate() {
     if (kind == 'text' && text.text.trim().isEmpty) return 'اكتبي نص الرسالة';
-    final lim = kLimit[kind]!;
-    if (lim > 0 && media.length != lim) {
-      return lim == 2 ? 'اختاري استيكرين' : 'اختاري ملفاً واحداً';
+    if (kind != 'text' && media.isEmpty) {
+      return kind == 'stickers' ? 'اختاري استيكراً واحداً على الأقل' : 'اختاري صورة';
     }
     return null;
   }
@@ -1407,12 +1406,12 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
     final catLabel = _cat == null ? '' : ' (${_cat == kNoCat ? 'بدون تصنيف' : _cat})';
     final old = Store.job != null;
     final ok = await ask(context, 'بدء الإرسال',
-        '${kKinds[kind]} إلى ${sel.length} جروب$catLabel.${old ? '\nسيتم إغلاق المهمة غير المنتهية السابقة.' : ''}',
+        '${kindName(kind)}${kind == 'stickers' ? ' (${media.length})' : ''} إلى ${sel.length} جروب$catLabel.${old ? '\nسيتم إغلاق المهمة غير المنتهية السابقة.' : ''}',
         ok: 'ابدأ');
     if (!ok || !mounted) return;
     Store.data['job'] = {
       'kind': kind,
-      'text': kind == 'sticker1' || kind == 'sticker2' ? '' : text.text.trim(),
+      'text': (kind == 'text' || kind == 'imageText') ? text.text.trim() : '',
       'media': kind == 'text' ? <String>[] : media,
       'groups': sel.map((g) => g.toJson()).toList(),
       'st': List<String>.filled(sel.length, 'pending'),
@@ -1440,12 +1439,22 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
                     builder: (_) => WaGroupsScreen(groups: groups))),
             icon: const Icon(Icons.groups)),
         IconButton(
+            tooltip: 'استيراد ملف Excel',
+            onPressed: _importExcel,
+            icon: const Icon(Icons.upload_file)),
+        IconButton(
             tooltip: 'تحديث من ملف Excel',
             onPressed: _reload,
             icon: const Icon(Icons.refresh)),
       ]),
       body: ListView(padding: const EdgeInsets.all(16), children: [
         if (loading) const LinearProgressIndicator(),
+        OutlinedButton.icon(
+          onPressed: _importExcel,
+          icon: const Icon(Icons.upload_file),
+          label: const Text('استيراد ملف Excel'),
+        ),
+        const SizedBox(height: 8),
         if (err != null)
           Card(
               color: Theme.of(context).colorScheme.errorContainer,
@@ -1574,8 +1583,12 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
           if (media.length < lim)
             OutlinedButton.icon(
               onPressed: _pick,
-              icon: const Icon(Icons.add_photo_alternate),
-              label: Text('اختيار من الهاتف (${media.length}/$lim)'),
+              icon: Icon(kind == 'stickers'
+                  ? Icons.emoji_emotions
+                  : Icons.add_photo_alternate),
+              label: Text(kind == 'stickers'
+                  ? 'إضافة استيكرات .webp (${media.length})'
+                  : 'اختيار صورة من الهاتف (${media.length}/$lim)'),
             ),
         ],
         const SizedBox(height: 24),
@@ -1795,7 +1808,7 @@ class _SendScreenState extends State<SendScreen> {
                   ),
                 Expanded(
                     child: Text(
-                        body.isEmpty ? kKinds[kind]! : '${kKinds[kind]}: $body',
+                        body.isEmpty ? kindName(kind) : '${kindName(kind)}: $body',
                         maxLines: 3,
                         overflow: TextOverflow.ellipsis)),
               ]),
