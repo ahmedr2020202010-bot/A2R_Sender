@@ -165,8 +165,25 @@ jobs:
           open(f, 'w', encoding='utf-8').write(s)
           PY
 
+      - name: Cache Gradle (avoids re-downloading from Maven)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ github.run_number }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
       - run: flutter pub get
-      - run: flutter build apk --release
+      - name: Build APK (retries on Maven 429 / network errors)
+        run: |
+          for i in 1 2 3 4; do
+            if flutter build apk --release; then exit 0; fi
+            echo "Build attempt $i failed; waiting before retry..."
+            sleep $((i * 60))
+          done
+          exit 1
       - name: Publish release with the APK
         id: rel
         continue-on-error: true
