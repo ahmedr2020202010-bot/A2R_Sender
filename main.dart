@@ -8,12 +8,14 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:image_picker/image_picker.dart' show ImagePicker, ImageSource;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 // ======================= الإعدادات =======================
-const String kDir = '/storage/emulated/0/A2R_Sender';
+const String kRoot = '/storage/emulated/0';
+const String kDir = '$kRoot/A2R_Sender';
 const String kFile = '$kDir/groups.xlsx';
 const MethodChannel _ch = MethodChannel('a2r/share');
 
@@ -948,24 +950,60 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
     _saveDraft();
   }
 
-  Future<void> _pick() async {
-    final room = kLimit[kind]! - media.length;
-    if (room <= 0) return;
-    // الاستيكرات ملفات .webp: تُختار من مدير الملفات وليس من معرض الصور.
-    final res = kind == 'stickers'
-        ? await FilePicker.platform.pickFiles(
-            type: FileType.custom,
-            allowedExtensions: ['webp'],
-            allowMultiple: true)
-        : await FilePicker.platform
-            .pickFiles(type: FileType.image, allowMultiple: room > 1);
-    if (res == null) return;
-    for (final f in res.files.take(room)) {
-      if (f.path != null) media.add(await persistMedia(f.path!));
+  String _firstDir(List<String> c) {
+    for (final d in c) {
+      if (Directory(d).existsSync()) return d;
+    }
+    return kRoot;
+  }
+
+  Future<void> _addMedia(List<String> paths) async {
+    for (final f in paths) {
+      media.add(await persistMedia(f));
     }
     if (!mounted) return;
     setState(() {});
     _saveDraft();
+  }
+
+  /// صورة من معرض الصور في الهاتف.
+  Future<void> _gallery() async {
+    if (kLimit[kind]! - media.length <= 0) return;
+    try {
+      final x = await ImagePicker().pickImage(source: ImageSource.gallery);
+      if (x == null) return;
+      await _addMedia([x.path]);
+    } catch (e) {
+      if (mounted) snack(context, 'تعذر فتح معرض الصور: $e');
+    }
+  }
+
+  /// تصفح مجلدات الهاتف مع تذكر آخر مجلد (للاستيكرات أو الصور).
+  Future<void> _browse() async {
+    final room = kLimit[kind]! - media.length;
+    if (room <= 0) return;
+    await prepareFolder(); // يطلب صلاحية الملفات لو لم تُمنح
+    if (!mounted) return;
+    final st = kind == 'stickers';
+    final res = await Navigator.push<List<String>>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => MediaBrowser(
+          title: st ? 'اختيار استيكرات' : 'اختيار صورة',
+          storeKey: st ? 'dirSticker' : 'dirImage',
+          fallbackDir: st
+              ? _firstDir([
+                  '$kRoot/Android/media/com.whatsapp.w4b/WhatsApp Business/Media/WhatsApp Business Stickers',
+                  '$kRoot/Download',
+                ])
+              : _firstDir(['$kRoot/DCIM/Camera', '$kRoot/Pictures', '$kRoot/Download']),
+          exts: st ? ['webp'] : ['jpg', 'jpeg', 'png', 'webp'],
+          max: room,
+        ),
+      ),
+    );
+    if (res == null || res.isEmpty) return;
+    await _addMedia(res);
   }
 
   String? _validate() {
@@ -1139,15 +1177,18 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
               Stack(children: [
                 ClipRRect(
                   borderRadius: BorderRadius.circular(12),
-                  child: Image.file(File(media[i]),
-                      width: 110,
-                      height: 110,
-                      fit: BoxFit.cover,
-                      cacheWidth: 250,
-                      errorBuilder: (_, __, ___) => const SizedBox(
-                          width: 110,
-                          height: 110,
-                          child: Icon(Icons.broken_image))),
+                  child: Container(
+                    width: 120,
+                    height: 120,
+                    color: Colors.black12,
+                    child: Image.file(File(media[i]),
+                        width: 120,
+                        height: 120,
+                        fit: kind == 'stickers' ? BoxFit.contain : BoxFit.cover,
+                        cacheWidth: 300,
+                        errorBuilder: (_, __, ___) => const Center(
+                            child: Icon(Icons.broken_image))),
+                  ),
                 ),
                 PositionedDirectional(
                   top: 0,
@@ -1164,16 +1205,25 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
               ]),
           ]),
           const SizedBox(height: 12),
-          if (media.length < lim)
+          if (media.length < lim) ...[
+            if (kind != 'stickers') ...[
+              OutlinedButton.icon(
+                onPressed: _gallery,
+                icon: const Icon(Icons.photo_library),
+                label: const Text('اختيار من معرض الصور'),
+              ),
+              const SizedBox(height: 8),
+            ],
             OutlinedButton.icon(
-              onPressed: _pick,
+              onPressed: _browse,
               icon: Icon(kind == 'stickers'
                   ? Icons.emoji_emotions
-                  : Icons.add_photo_alternate),
+                  : Icons.folder_open),
               label: Text(kind == 'stickers'
-                  ? 'إضافة استيكرات .webp (${media.length})'
-                  : 'اختيار صورة من الهاتف (${media.length}/$lim)'),
+                  ? 'إضافة استيكرات (${media.length}) — آخر مجلد محفوظ'
+                  : 'اختيار من مجلد — آخر مجلد محفوظ'),
             ),
+          ],
         ],
         const SizedBox(height: 24),
         FilledButton.icon(
@@ -1426,6 +1476,201 @@ class _SendScreenState extends State<SendScreen> {
                     label: const Text('تخطي'))),
           ]),
         ],
+      ]),
+    );
+  }
+}
+
+
+// ======================= متصفح الملفات (استيكرات / صور) مع حفظ آخر مجلد =======================
+class MediaBrowser extends StatefulWidget {
+  final String title, storeKey, fallbackDir;
+  final List<String> exts;
+  final int max;
+  const MediaBrowser({
+    super.key,
+    required this.title,
+    required this.storeKey,
+    required this.fallbackDir,
+    required this.exts,
+    required this.max,
+  });
+  @override
+  State<MediaBrowser> createState() => _MediaBrowserState();
+}
+
+class _MediaBrowserState extends State<MediaBrowser> {
+  late String dir;
+  List<Directory> dirs = [];
+  List<File> files = [];
+  final List<String> sel = [];
+  String? error;
+
+  bool get atRoot => dir == kRoot || dir == '/' || p.dirname(dir) == dir;
+
+  @override
+  void initState() {
+    super.initState();
+    final saved = Store.data[widget.storeKey];
+    dir = (saved is String && Directory(saved).existsSync())
+        ? saved
+        : widget.fallbackDir;
+    _scan();
+  }
+
+  void _scan() {
+    try {
+      final d = <Directory>[];
+      final f = <File>[];
+      for (final e in Directory(dir).listSync(followLinks: false)) {
+        final n = p.basename(e.path);
+        if (n.startsWith('.')) continue;
+        if (e is Directory) {
+          d.add(e);
+        } else if (e is File &&
+            widget.exts
+                .contains(p.extension(n).toLowerCase().replaceFirst('.', ''))) {
+          f.add(e);
+        }
+      }
+      d.sort((a, b) => p
+          .basename(a.path)
+          .toLowerCase()
+          .compareTo(p.basename(b.path).toLowerCase()));
+      f.sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
+      dirs = d;
+      files = f;
+      error = null;
+      Store.data[widget.storeKey] = dir; // آخر مسار
+      Store.save();
+    } catch (_) {
+      dirs = [];
+      files = [];
+      error =
+          'لا أستطيع فتح هذا المجلد. اسمحي للتطبيق بالوصول إلى الملفات من إعدادات الهاتف.';
+    }
+  }
+
+  void _go(String d) {
+    setState(() {
+      dir = d;
+      _scan();
+    });
+  }
+
+  void _toggle(String path) {
+    setState(() {
+      if (sel.contains(path)) {
+        sel.remove(path);
+      } else if (widget.max == 1) {
+        sel
+          ..clear()
+          ..add(path);
+      } else if (sel.length >= widget.max) {
+        snack(context, 'الحد الأقصى ${widget.max}');
+      } else {
+        sel.add(path);
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        leading: IconButton(
+          tooltip: 'المجلد الأعلى',
+          icon: const Icon(Icons.arrow_upward),
+          onPressed: atRoot ? null : () => _go(p.dirname(dir)),
+        ),
+        title: Text(widget.title),
+        actions: [
+          TextButton(
+            onPressed:
+                sel.isEmpty ? null : () => Navigator.pop(context, List<String>.from(sel)),
+            child: Text('تم (${sel.length})'),
+          ),
+        ],
+      ),
+      body: Column(children: [
+        Padding(
+          padding: const EdgeInsets.all(8),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: Text(dir,
+                textDirection: TextDirection.ltr,
+                style: Theme.of(context).textTheme.bodySmall),
+          ),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: error != null
+              ? Center(
+                  child: Padding(
+                      padding: const EdgeInsets.all(16), child: Text(error!)))
+              : CustomScrollView(slivers: [
+                  SliverList(
+                    delegate: SliverChildBuilderDelegate(
+                      (c, i) => ListTile(
+                        dense: true,
+                        leading: const Icon(Icons.folder),
+                        title: Text(p.basename(dirs[i].path)),
+                        onTap: () => _go(dirs[i].path),
+                      ),
+                      childCount: dirs.length,
+                    ),
+                  ),
+                  if (files.isEmpty)
+                    const SliverToBoxAdapter(
+                      child: Padding(
+                        padding: EdgeInsets.all(16),
+                        child: Text('لا توجد ملفات مناسبة في هذا المجلد'),
+                      ),
+                    ),
+                  SliverPadding(
+                    padding: const EdgeInsets.all(8),
+                    sliver: SliverGrid(
+                      gridDelegate:
+                          const SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: 3,
+                              mainAxisSpacing: 8,
+                              crossAxisSpacing: 8),
+                      delegate: SliverChildBuilderDelegate(
+                        (c, i) {
+                          final f = files[i];
+                          final on = sel.contains(f.path);
+                          return GestureDetector(
+                            onTap: () => _toggle(f.path),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(10),
+                              child: Stack(fit: StackFit.expand, children: [
+                                Container(
+                                  color: Colors.black12,
+                                  child: Image.file(f,
+                                      fit: BoxFit.contain,
+                                      cacheWidth: 300,
+                                      errorBuilder: (_, __, ___) =>
+                                          const Center(
+                                              child:
+                                                  Icon(Icons.broken_image))),
+                                ),
+                                if (on)
+                                  Container(
+                                    color: Colors.black45,
+                                    child: const Center(
+                                        child: Icon(Icons.check_circle,
+                                            color: Colors.white, size: 40)),
+                                  ),
+                              ]),
+                            ),
+                          );
+                        },
+                        childCount: files.length,
+                      ),
+                    ),
+                  ),
+                ]),
+        ),
       ]),
     );
   }
