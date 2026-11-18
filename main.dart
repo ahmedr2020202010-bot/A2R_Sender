@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:archive/archive.dart' show ZipDecoder;
 import 'package:excel/excel.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -723,8 +724,102 @@ G? parseRow(List<String> c) {
   return (groups: out, dups: dups, off: off);
 }
 
+String _xmlUnesc(String s) => s
+    .replaceAllMapped(RegExp(r'&#x([0-9a-fA-F]+);'),
+        (m) => String.fromCharCode(int.parse(m[1]!, radix: 16)))
+    .replaceAllMapped(
+        RegExp(r'&#(\d+);'), (m) => String.fromCharCode(int.parse(m[1]!)))
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&apos;', "'")
+    .replaceAll('&amp;', '&');
+
+String _tText(String x) => RegExp(r'<t(?:\s[^>]*)?>([\s\S]*?)</t>')
+    .allMatches(x)
+    .map((m) => _xmlUnesc(m.group(1)!))
+    .join();
+
+int _colIdx(String ref) {
+  var n = 0;
+  for (final c in ref.toUpperCase().codeUnits) {
+    if (c < 65 || c > 90) break;
+    n = n * 26 + (c - 64);
+  }
+  return n - 1;
+}
+
+/// قارئ xlsx بسيط وسريع (يدعم inlineStr وsharedStrings) لملفات التصدير التي تفشل مع مكتبة excel.
+List<List<String>> readXlsxRaw(List<int> bytes) {
+  final arc = ZipDecoder().decodeBytes(bytes);
+  String? read(String name) {
+    for (final f in arc.files) {
+      if (f.isFile && f.name == name) {
+        return utf8.decode(f.content as List<int>, allowMalformed: true);
+      }
+    }
+    return null;
+  }
+
+  final ss = <String>[];
+  final sx = read('xl/sharedStrings.xml');
+  if (sx != null) {
+    for (final m in RegExp(r'<si\b[^>]*>([\s\S]*?)</si>').allMatches(sx)) {
+      ss.add(_tText(m.group(1)!));
+    }
+  }
+  final sheets = <int, String>{};
+  for (final f in arc.files) {
+    final m = RegExp(r'^xl/worksheets/sheet(\d+)\.xml$').firstMatch(f.name);
+    if (f.isFile && m != null) sheets[int.parse(m.group(1)!)] = f.name;
+  }
+  if (sheets.isEmpty) return [];
+  final first = (sheets.keys.toList()..sort()).first;
+  final sheet = read(sheets[first]!);
+  if (sheet == null) return [];
+
+  final rows = <List<String>>[];
+  for (final rm
+      in RegExp(r'<row\b[^>]*?(?:/>|>([\s\S]*?)</row>)').allMatches(sheet)) {
+    final content = rm.group(1) ?? '';
+    final cells = <int, String>{};
+    var maxC = -1, auto = 0;
+    for (final cm
+        in RegExp(r'<c\b([^>]*?)(?:/>|>([\s\S]*?)</c>)').allMatches(content)) {
+      final attrs = cm.group(1)!;
+      final body = cm.group(2) ?? '';
+      final ref = RegExp(r'\br="([A-Za-z]+)\d*"').firstMatch(attrs)?.group(1);
+      final idx = ref != null ? _colIdx(ref) : auto;
+      auto = idx + 1;
+      final t = RegExp(r'\bt="(\w+)"').firstMatch(attrs)?.group(1);
+      String v;
+      if (t == 'inlineStr') {
+        v = _tText(body);
+      } else {
+        final vm = RegExp(r'<v[^>]*>([\s\S]*?)</v>').firstMatch(body);
+        final raw = vm == null ? '' : _xmlUnesc(vm.group(1)!);
+        if (t == 's') {
+          final k = int.tryParse(raw);
+          v = (k != null && k >= 0 && k < ss.length) ? ss[k] : '';
+        } else {
+          v = raw;
+        }
+      }
+      cells[idx] = v;
+      if (idx > maxC) maxC = idx;
+    }
+    rows.add(List<String>.generate(maxC + 1, (i) => cells[i] ?? ''));
+  }
+  return rows;
+}
+
 List<List<String>> readRows(String path) {
-  final book = Excel.decodeBytes(File(path).readAsBytesSync());
+  final bytes = File(path).readAsBytesSync();
+  try {
+    final r = readXlsxRaw(bytes);
+    if (r.isNotEmpty) return r;
+  } catch (_) {}
+  final book = Excel.decodeBytes(bytes);
   if (book.tables.isEmpty) return [];
   final sheet = book.tables[book.tables.keys.first]!;
   return sheet.rows
@@ -846,11 +941,15 @@ Future<bool> ask(BuildContext c, String title, String body,
 class Wa {
   static final Map<String, String?> _matchC = {};
   static Map<String, Set<String>>? _setsC;
+  static List<String>? _namesC;
+  static List<Set<String>>? _tokC;
 
   /// يُستدعى كلما تغيّرت الأسماء المسحوبة أو التصنيفات.
   static void invalidate() {
     _matchC.clear();
     _setsC = null;
+    _namesC = null;
+    _tokC = null;
   }
 
   static List<String> get names =>
@@ -892,7 +991,11 @@ class Wa {
     if (m is Map && m[g.key] is String && (m[g.key] as String).isNotEmpty) {
       return m[g.key] as String;
     }
-    return _matchC.putIfAbsent(g.key, () => autoMatch(g, names));
+    return _matchC.putIfAbsent(g.key, () {
+      final n = _namesC ??= names;
+      final t = _tokC ??= n.map((w) => _toks(w).toSet()).toList();
+      return autoMatch(g, n, t);
+    });
   }
 
   static bool inWaCat(G g, String cat) {
@@ -921,7 +1024,7 @@ List<String> _toks(String s) => RegExp(r'\p{L}+|\p{N}+', unicode: true)
     .toList();
 
 /// يطابق صف الشيت مع أقرب اسم جروب في واتساب. يرجع null لو لا يوجد تطابق واضح.
-String? autoMatch(G g, List<String> wa) {
+String? autoMatch(G g, List<String> wa, [List<Set<String>>? pre]) {
   if (wa.isEmpty) return null;
   final st = <String>[
     ..._toks(g.name),
@@ -930,8 +1033,9 @@ String? autoMatch(G g, List<String> wa) {
   if (st.isEmpty) return null;
   String? best;
   var b1 = 0.0, b2 = 0.0;
-  for (final w in wa) {
-    final wt = _toks(w).toSet();
+  for (var wi = 0; wi < wa.length; wi++) {
+    final w = wa[wi];
+    final wt = pre != null ? pre[wi] : _toks(w).toSet();
     if (wt.isEmpty) continue;
     final hits = st.where((x) => wt.contains(x)).length;
     final extra = wt.length - hits;
