@@ -386,13 +386,18 @@ class Store {
   }
 }
 
+int _mediaSeq = 0;
+
 Future<String> persistMedia(String src) async {
   final dir = Directory(
       p.join((await getApplicationSupportDirectory()).path, 'media'));
   await dir.create(recursive: true);
+  final ext = p.extension(src).toLowerCase();
+  _mediaSeq++;
   final dest = p.join(dir.path,
-      '${DateTime.now().microsecondsSinceEpoch}${p.extension(src).toLowerCase()}');
-  await File(src).copy(dest);
+      '${DateTime.now().microsecondsSinceEpoch}_$_mediaSeq${ext.isEmpty ? '.webp' : ext}');
+  final bytes = await File(src).readAsBytes();
+  await File(dest).writeAsBytes(bytes, flush: true);
   return dest;
 }
 
@@ -872,12 +877,14 @@ class Bubble {
   }
 }
 
-/// جلسة الإرسال الفردي: كل جروب يفتح واتساب بالرسالة ثم يكتب كلمة بحثه.
-Map<String, dynamic> jobSession(Map<String, dynamic> job) {
+/// جلسة الإرسال الفردي: وضع المراجعة (البحث في القائمة الرئيسية) أو المشاركة المباشرة.
+Map<String, dynamic> jobSession(Map<String, dynamic> job,
+    {String mode = 'review'}) {
   final gs = job['groups'] as List;
   final st = job['st'] as List;
   return {
     'id': 'job',
+    'mode': mode,
     'text': job['text'] as String,
     'media': (job['media'] as List).map((e) => e.toString()).toList(),
     'items': List.generate(gs.length, (i) {
@@ -893,12 +900,14 @@ Map<String, dynamic> jobSession(Map<String, dynamic> job) {
 }
 
 /// جلسة المصنف: واتساب يُفتح مرة لكل دفعة، وكل ضغطة تكتب اسم الجروب التالي في الدفعة.
-Map<String, dynamic> labelSession(Map<String, dynamic> job) {
+Map<String, dynamic> labelSession(Map<String, dynamic> job,
+    {String mode = 'share'}) {
   final names = (job['items'] as List).map((e) => e.toString()).toList();
   final st = job['st'] as List;
   final bs = ((job['batch'] as int?) ?? 5).clamp(1, 30).toInt();
   return {
     'id': 'ujob',
+    'mode': mode,
     'text': job['text'] as String,
     'media': (job['media'] as List).map((e) => e.toString()).toList(),
     'items': List.generate(names.length, (i) => {
@@ -1393,12 +1402,24 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
   }
 
   Future<void> _addMedia(List<String> paths) async {
+    var added = 0;
+    var failed = 0;
     for (final f in paths) {
-      media.add(await persistMedia(f));
+      try {
+        media.add(await persistMedia(f));
+        added++;
+      } catch (_) {
+        failed++;
+      }
     }
     if (!mounted) return;
     setState(() {});
     _saveDraft();
+    if (failed > 0) {
+      snack(context, 'تمت إضافة $added وتعذر نسخ $failed ملف');
+    } else if (added > 0) {
+      snack(context, 'تمت إضافة $added ملف بنجاح');
+    }
   }
 
   /// صورة من معرض الصور في الهاتف.
@@ -1436,7 +1457,7 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
                   '$kRoot/Download',
                 ])
               : _firstDir(['$kRoot/DCIM/Camera', '$kRoot/Pictures', '$kRoot/Download']),
-          exts: st ? ['webp'] : ['jpg', 'jpeg', 'png', 'webp'],
+          exts: st ? ['webp', 'png', 'gif'] : ['jpg', 'jpeg', 'png', 'webp'],
           max: room,
         ),
       ),
@@ -1698,13 +1719,24 @@ class _SendScreenState extends State<SendScreen> with WidgetsBindingObserver {
   late Map<String, dynamic> job;
   int? forced;
   bool opened = false;
+  late String sendMode;
 
   @override
   void initState() {
     super.initState();
     job = Store.job!;
+    final savedMode = Store.data['sendMode'];
+    sendMode = (savedMode == 'share' || savedMode == 'review')
+        ? savedMode as String
+        : 'review';
     WidgetsBinding.instance.addObserver(this);
     _sync();
+  }
+
+  void _setSendMode(String m) {
+    setState(() => sendMode = m);
+    Store.data['sendMode'] = m;
+    Store.save();
   }
 
   @override
@@ -1733,7 +1765,7 @@ class _SendScreenState extends State<SendScreen> with WidgetsBindingObserver {
         return;
       }
     }
-    final err = await Bubble.start(jobSession(job), i);
+    final err = await Bubble.start(jobSession(job, mode: sendMode), i);
     if (!mounted) return;
     if (err != null) {
       snack(context, err);
@@ -1941,6 +1973,43 @@ class _SendScreenState extends State<SendScreen> with WidgetsBindingObserver {
             ),
           ),
           const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('طريقة البحث في واتساب:',
+                      style: t.textTheme.titleSmall),
+                  const SizedBox(height: 8),
+                  SegmentedButton<String>(
+                    segments: const [
+                      ButtonSegment(
+                        value: 'review',
+                        label: Text('بحث في الرئيسية (مراجعة)'),
+                        icon: Icon(Icons.search),
+                      ),
+                      ButtonSegment(
+                        value: 'share',
+                        label: Text('مشاركة مباشرة'),
+                        icon: Icon(Icons.share),
+                      ),
+                    ],
+                    selected: {sendMode},
+                    onSelectionChanged: (v) => _setSendMode(v.first),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    sendMode == 'review'
+                        ? 'يبحث برقم الجروب في القائمة الرئيسية لتتأكد من بيانات الجروب ووصفه، ثم تضغط "تجهيز" من الشريط العائم فتظهر الرسالة جاهزة على الإرسال.'
+                        : 'يفتح شاشة المشاركة بالرسالة مباشرة ويبحث برقم الجروب للإرسال السريع.',
+                    style: t.textTheme.bodySmall,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
           BubbleCard(
               startLabel: 'تشغيل الفقاعة من هذا الجروب',
               onStart: () => _startBubble(i)),
@@ -2070,104 +2139,186 @@ class _MediaBrowserState extends State<MediaBrowser> {
     });
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        leading: IconButton(
-          tooltip: 'المجلد الأعلى',
-          icon: const Icon(Icons.arrow_upward),
-          onPressed: atRoot ? null : () => _go(p.dirname(dir)),
-        ),
-        title: Text(widget.title),
+  void _confirm() {
+    Navigator.pop(context, List<String>.from(sel));
+  }
+
+  Future<void> _onBack() async {
+    if (sel.isEmpty) {
+      Navigator.pop(context);
+      return;
+    }
+    final r = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('تأكيد الاختيار'),
+        content: Text('تم تحديد ${sel.length} ملف. هل تريد اعتمادهم أم إلغاء الاختيار؟'),
         actions: [
           TextButton(
-            onPressed:
-                sel.isEmpty ? null : () => Navigator.pop(context, List<String>.from(sel)),
-            child: Text('تم (${sel.length})'),
-          ),
+              onPressed: () => Navigator.pop(ctx, 'discard'),
+              child: const Text('إلغاء الاختيار')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, 'keep'),
+              child: Text('اعتماد (${sel.length})')),
         ],
       ),
-      body: Column(children: [
-        Padding(
-          padding: const EdgeInsets.all(8),
-          child: Align(
-            alignment: Alignment.centerLeft,
-            child: Text(dir,
-                textDirection: TextDirection.ltr,
-                style: Theme.of(context).textTheme.bodySmall),
+    );
+    if (!mounted) return;
+    if (r == 'keep') {
+      _confirm();
+    } else if (r == 'discard') {
+      Navigator.pop(context);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return PopScope(
+      canPop: sel.isEmpty,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _onBack();
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          leading: IconButton(
+            tooltip: 'رجوع',
+            icon: const Icon(Icons.arrow_back),
+            onPressed: _onBack,
+          ),
+          title: Text(widget.title),
+          actions: [
+            IconButton(
+              tooltip: 'المجلد الأعلى',
+              icon: const Icon(Icons.drive_folder_upload),
+              onPressed: atRoot ? null : () => _go(p.dirname(dir)),
+            ),
+            if (sel.isNotEmpty)
+              TextButton(
+                onPressed: _confirm,
+                child: Text('تم (${sel.length})'),
+              ),
+          ],
+        ),
+        body: Column(children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            child: Row(children: [
+              IconButton(
+                tooltip: 'المجلد الأعلى',
+                icon: const Icon(Icons.arrow_upward, size: 20),
+                onPressed: atRoot ? null : () => _go(p.dirname(dir)),
+              ),
+              Expanded(
+                child: Text(dir,
+                    textDirection: TextDirection.ltr,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodySmall),
+              ),
+            ]),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: error != null
+                ? Center(
+                    child: Padding(
+                        padding: const EdgeInsets.all(16), child: Text(error!)))
+                : CustomScrollView(slivers: [
+                    SliverList(
+                      delegate: SliverChildBuilderDelegate(
+                        (c, i) => ListTile(
+                          dense: true,
+                          leading: const Icon(Icons.folder),
+                          title: Text(p.basename(dirs[i].path)),
+                          onTap: () => _go(dirs[i].path),
+                        ),
+                        childCount: dirs.length,
+                      ),
+                    ),
+                    if (files.isEmpty)
+                      const SliverToBoxAdapter(
+                        child: Padding(
+                          padding: EdgeInsets.all(16),
+                          child: Text('لا توجد ملفات مناسبة في هذا المجلد'),
+                        ),
+                      ),
+                    SliverPadding(
+                      padding: const EdgeInsets.all(8),
+                      sliver: SliverGrid(
+                        gridDelegate:
+                            const SliverGridDelegateWithFixedCrossAxisCount(
+                                crossAxisCount: 3,
+                                mainAxisSpacing: 8,
+                                crossAxisSpacing: 8),
+                        delegate: SliverChildBuilderDelegate(
+                          (c, i) {
+                            final f = files[i];
+                            final selIdx = sel.indexOf(f.path);
+                            final on = selIdx >= 0;
+                            return GestureDetector(
+                              onTap: () => _toggle(f.path),
+                              child: Container(
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(10),
+                                  border: on
+                                      ? Border.all(color: cs.primary, width: 3)
+                                      : null,
+                                ),
+                                child: ClipRRect(
+                                  borderRadius: BorderRadius.circular(8),
+                                  child: Stack(fit: StackFit.expand, children: [
+                                    Container(
+                                      color: Colors.black12,
+                                      child: Image.file(f,
+                                          fit: BoxFit.contain,
+                                          cacheWidth: 300,
+                                          errorBuilder: (_, __, ___) =>
+                                              const Center(
+                                                  child: Icon(
+                                                      Icons.broken_image))),
+                                    ),
+                                    if (on)
+                                      Container(
+                                        color: Colors.black38,
+                                        child: Center(
+                                          child: CircleAvatar(
+                                            radius: 18,
+                                            backgroundColor: cs.primary,
+                                            child: Text(
+                                              '${selIdx + 1}',
+                                              style: TextStyle(
+                                                  color: cs.onPrimary,
+                                                  fontWeight: FontWeight.bold),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                  ]),
+                                ),
+                              ),
+                            );
+                          },
+                          childCount: files.length,
+                        ),
+                      ),
+                    ),
+                  ]),
+          ),
+        ]),
+        bottomNavigationBar: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+            child: FilledButton.icon(
+              onPressed: sel.isEmpty ? null : _confirm,
+              icon: const Icon(Icons.check_circle),
+              label: Text(sel.isEmpty
+                  ? 'اضغط على الاستيكر أو الصورة للتحديد'
+                  : 'تأكيد الاختيار (${sel.length})'),
+            ),
           ),
         ),
-        const Divider(height: 1),
-        Expanded(
-          child: error != null
-              ? Center(
-                  child: Padding(
-                      padding: const EdgeInsets.all(16), child: Text(error!)))
-              : CustomScrollView(slivers: [
-                  SliverList(
-                    delegate: SliverChildBuilderDelegate(
-                      (c, i) => ListTile(
-                        dense: true,
-                        leading: const Icon(Icons.folder),
-                        title: Text(p.basename(dirs[i].path)),
-                        onTap: () => _go(dirs[i].path),
-                      ),
-                      childCount: dirs.length,
-                    ),
-                  ),
-                  if (files.isEmpty)
-                    const SliverToBoxAdapter(
-                      child: Padding(
-                        padding: EdgeInsets.all(16),
-                        child: Text('لا توجد ملفات مناسبة في هذا المجلد'),
-                      ),
-                    ),
-                  SliverPadding(
-                    padding: const EdgeInsets.all(8),
-                    sliver: SliverGrid(
-                      gridDelegate:
-                          const SliverGridDelegateWithFixedCrossAxisCount(
-                              crossAxisCount: 3,
-                              mainAxisSpacing: 8,
-                              crossAxisSpacing: 8),
-                      delegate: SliverChildBuilderDelegate(
-                        (c, i) {
-                          final f = files[i];
-                          final on = sel.contains(f.path);
-                          return GestureDetector(
-                            onTap: () => _toggle(f.path),
-                            child: ClipRRect(
-                              borderRadius: BorderRadius.circular(10),
-                              child: Stack(fit: StackFit.expand, children: [
-                                Container(
-                                  color: Colors.black12,
-                                  child: Image.file(f,
-                                      fit: BoxFit.contain,
-                                      cacheWidth: 300,
-                                      errorBuilder: (_, __, ___) =>
-                                          const Center(
-                                              child:
-                                                  Icon(Icons.broken_image))),
-                                ),
-                                if (on)
-                                  Container(
-                                    color: Colors.black45,
-                                    child: const Center(
-                                        child: Icon(Icons.check_circle,
-                                            color: Colors.white, size: 40)),
-                                  ),
-                              ]),
-                            ),
-                          );
-                        },
-                        childCount: files.length,
-                      ),
-                    ),
-                  ),
-                ]),
-        ),
-      ]),
+      ),
     );
   }
 }
@@ -2278,12 +2429,24 @@ class _LabelTabState extends State<LabelTab> with WidgetsBindingObserver {
   }
 
   Future<void> _addMedia(List<String> paths) async {
+    var added = 0;
+    var failed = 0;
     for (final f in paths) {
-      media.add(await persistMedia(f));
+      try {
+        media.add(await persistMedia(f));
+        added++;
+      } catch (_) {
+        failed++;
+      }
     }
     if (!mounted) return;
     setState(() {});
     _save();
+    if (failed > 0) {
+      snack(context, 'تمت إضافة $added وتعذر نسخ $failed ملف');
+    } else if (added > 0) {
+      snack(context, 'تمت إضافة $added ملف بنجاح');
+    }
   }
 
   Future<void> _gallery() async {
@@ -2319,7 +2482,7 @@ class _LabelTabState extends State<LabelTab> with WidgetsBindingObserver {
                   '$kRoot/Download',
                 ])
               : _firstDir(['$kRoot/DCIM/Camera', '$kRoot/Pictures', '$kRoot/Download']),
-          exts: st ? ['webp'] : ['jpg', 'jpeg', 'png', 'webp'],
+          exts: st ? ['webp', 'png', 'gif'] : ['jpg', 'jpeg', 'png', 'webp'],
           max: room,
         ),
       ),
