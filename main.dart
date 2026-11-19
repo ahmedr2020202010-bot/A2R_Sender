@@ -356,7 +356,12 @@ class Store {
   static Future<File> _file() async =>
       File(p.join((await getApplicationSupportDirectory()).path, 'state.json'));
 
-  static Future<void> load() async {
+  static Future<void>? _once;
+
+  /// تحميل مرة واحدة فقط (التابان يستدعيانه معاً).
+  static Future<void> load() => _once ??= _load();
+
+  static Future<void> _load() async {
     try {
       final f = await _file();
       if (f.existsSync()) {
@@ -374,6 +379,13 @@ class Store {
 
   static Map<String, dynamic>? get job {
     final j = data['job'];
+    if (j is Map<String, dynamic> && j['finished'] != true) return j;
+    return null;
+  }
+
+  /// مهمة تاب "رسالة لمصنف".
+  static Map<String, dynamic>? get ujob {
+    final j = data['ujob'];
     if (j is Map<String, dynamic> && j['finished'] != true) return j;
     return null;
   }
@@ -764,6 +776,261 @@ class _PickDialogState extends State<_PickDialog> {
   }
 }
 
+// ======================= الفقاعة العائمة (خدمة إمكانية الوصول) =======================
+/// جسر للجزء الأصلي (Kotlin): الفقاعة تكتب كلمة البحث في واتساب بيزنس وتنقل للجروب التالي.
+class Bubble {
+  static const List<String> _codes = ['pending', 'done', 'skipped'];
+  static int code(String s) => s == 'done' ? 1 : (s == 'skipped' ? 2 : 0);
+
+  static Future<Map<String, dynamic>> status() async {
+    try {
+      final r = await _ch.invokeMethod<Map>('svcStatus');
+      return (r ?? {}).map((k, v) => MapEntry(k.toString(), v));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  /// يشغّل الجلسة ويفتح العنصر [at]. يرجع نص الخطأ أو null عند النجاح.
+  static Future<String?> start(Map<String, dynamic> session, int at) async {
+    try {
+      await _ch.invokeMethod<bool>(
+          'start', {'session': jsonEncode(session), 'at': at});
+      return null;
+    } on PlatformException catch (e) {
+      return e.code == 'NO_A11Y'
+          ? 'فعّلي خدمة A2R Sender من إعدادات إمكانية الوصول أولاً'
+          : (e.message ?? 'تعذر تشغيل الفقاعة');
+    } catch (e) {
+      return '$e';
+    }
+  }
+
+  static Future<Map<String, dynamic>?> state() async {
+    try {
+      final s = await _ch.invokeMethod<String>('state');
+      if (s == null || s.isEmpty) return null;
+      return jsonDecode(s) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> stop() async {
+    try {
+      await _ch.invokeMethod<bool>('stop');
+    } catch (_) {}
+  }
+
+  static Future<void> clear() async {
+    try {
+      await _ch.invokeMethod<bool>('clear');
+    } catch (_) {}
+  }
+
+  static Future<void> setStatus(int i, String st) async {
+    try {
+      await _ch.invokeMethod<bool>('setStatus', {'i': i, 's': code(st)});
+    } catch (_) {}
+  }
+
+  static Future<void> open(String what) async {
+    try {
+      await _ch.invokeMethod<bool>(what);
+    } catch (_) {}
+  }
+
+  /// يدمج حالات الفقاعة (تم/تخطي) في المهمة المحفوظة [key] = job أو ujob.
+  static Future<({bool active, bool changed})> sync(String key) async {
+    final j = Store.data[key];
+    if (j is! Map) return (active: false, changed: false);
+    final s = await state();
+    if (s == null || s['id'] != key) return (active: false, changed: false);
+    var changed = false;
+    final st = j['st'];
+    final ns = s['st'];
+    if (st is List && ns is List && st.length == ns.length) {
+      for (var i = 0; i < st.length; i++) {
+        final n = ns[i];
+        final v = _codes[(n is int ? n : 0).clamp(0, 2).toInt()];
+        if (st[i] != v) {
+          st[i] = v;
+          changed = true;
+        }
+      }
+      if (changed) await Store.save();
+    }
+    final active = s['active'] == true;
+    if (!active) await clear();
+    return (active: active, changed: changed);
+  }
+
+  static Future<void> syncAll() async {
+    await sync('job');
+    await sync('ujob');
+  }
+
+  /// قبل إنشاء مهمة جديدة: إنهاء أي جلسة قديمة حتى لا تختلط حالاتها.
+  static Future<void> reset() async {
+    await stop();
+    await clear();
+  }
+}
+
+/// جلسة الإرسال الفردي: كل جروب يفتح واتساب بالرسالة ثم يكتب كلمة بحثه.
+Map<String, dynamic> jobSession(Map<String, dynamic> job) {
+  final gs = job['groups'] as List;
+  final st = job['st'] as List;
+  return {
+    'id': 'job',
+    'text': job['text'] as String,
+    'media': (job['media'] as List).map((e) => e.toString()).toList(),
+    'items': List.generate(gs.length, (i) {
+      final g = G.fromJson(gs[i] as Map<String, dynamic>);
+      return {
+        't': g.title,
+        'k': waKey(g),
+        'l': true,
+        's': Bubble.code(st[i] as String),
+      };
+    }),
+  };
+}
+
+/// جلسة المصنف: واتساب يُفتح مرة لكل دفعة، وكل ضغطة تكتب اسم الجروب التالي في الدفعة.
+Map<String, dynamic> labelSession(Map<String, dynamic> job) {
+  final names = (job['items'] as List).map((e) => e.toString()).toList();
+  final st = job['st'] as List;
+  final bs = ((job['batch'] as int?) ?? 5).clamp(1, 30).toInt();
+  return {
+    'id': 'ujob',
+    'text': job['text'] as String,
+    'media': (job['media'] as List).map((e) => e.toString()).toList(),
+    'items': List.generate(names.length, (i) => {
+          't': names[i],
+          'k': names[i],
+          'l': i % bs == 0,
+          's': Bubble.code(st[i] as String),
+        }),
+  };
+}
+
+/// بطاقة تفعيل الفقاعة وتشغيلها.
+class BubbleCard extends StatefulWidget {
+  final String startLabel;
+  final Future<void> Function() onStart;
+  const BubbleCard({super.key, required this.startLabel, required this.onStart});
+  @override
+  State<BubbleCard> createState() => _BubbleCardState();
+}
+
+class _BubbleCardState extends State<BubbleCard> with WidgetsBindingObserver {
+  Map<String, dynamic> st = {};
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _load();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState s) {
+    if (s == AppLifecycleState.resumed) _load();
+  }
+
+  Future<void> _load() async {
+    final r = await Bubble.status();
+    if (mounted) setState(() => st = r);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final on = st['a11y'] == true;
+    final t = Theme.of(context);
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Icon(Icons.bubble_chart,
+                color: on ? Colors.green : t.colorScheme.outline),
+            const SizedBox(width: 8),
+            Expanded(
+                child: Text(
+                    on
+                        ? 'الفقاعة العائمة جاهزة'
+                        : 'الفقاعة العائمة (تفعيل لمرة واحدة)',
+                    style: t.textTheme.titleSmall)),
+          ]),
+          const SizedBox(height: 8),
+          if (!on) ...[
+            const Text(
+                'تكتب الفقاعة كلمة البحث في واتساب بيزنس بدل اللصق اليدوي، وتنقلك للجروب التالي بدون الرجوع للتطبيق. '
+                'فعّلي \"A2R Sender\" من إعدادات إمكانية الوصول (الخدمات المثبتة). الخدمة مقصورة على واتساب بيزنس '
+                'ولا تضغط على الجروب ولا على إرسال.'),
+            const SizedBox(height: 8),
+            FilledButton.tonalIcon(
+                onPressed: () => Bubble.open('openA11y'),
+                icon: const Icon(Icons.accessibility_new),
+                label: const Text('فتح إعدادات إمكانية الوصول')),
+            TextButton(
+                onPressed: () => Bubble.open('openAppInfo'),
+                child: const Text(
+                    'التفعيل مقفول أو ظهرت رسالة \"إعداد مقيّد\"؟ افتحي معلومات التطبيق')),
+          ] else ...[
+            FilledButton.icon(
+                onPressed: widget.onStart,
+                icon: const Icon(Icons.play_circle_outline),
+                label: Text(widget.startLabel)),
+            if (st['overlay'] != true)
+              TextButton(
+                  onPressed: () => Bubble.open('openOverlay'),
+                  child: const Text(
+                      'لو الفقاعة لا تفتح واتساب: اسمحي بالعرض فوق التطبيقات')),
+          ],
+        ]),
+      ),
+    );
+  }
+}
+
+// ======================= الهيكل: تابان =======================
+class Shell extends StatefulWidget {
+  const Shell({super.key});
+  @override
+  State<Shell> createState() => _ShellState();
+}
+
+class _ShellState extends State<Shell> {
+  int tab = 0;
+  @override
+  Widget build(BuildContext context) {
+    final kb = MediaQuery.of(context).viewInsets.bottom > 0;
+    return Scaffold(
+      body: IndexedStack(index: tab, children: const [Home(), LabelTab()]),
+      bottomNavigationBar: kb
+          ? null
+          : NavigationBar(
+              selectedIndex: tab,
+              onDestinationSelected: (v) => setState(() => tab = v),
+              destinations: const [
+                NavigationDestination(
+                    icon: Icon(Icons.send), label: 'إرسال لكل جروب'),
+                NavigationDestination(
+                    icon: Icon(Icons.label_outline), label: 'رسالة لمصنف'),
+              ],
+            ),
+    );
+  }
+}
+
 // ======================= التطبيق =======================
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -793,7 +1060,7 @@ class App extends StatelessWidget {
         outlinedButtonTheme: OutlinedButtonThemeData(
             style: OutlinedButton.styleFrom(minimumSize: big)),
       ),
-      home: const Home(),
+      home: const Shell(),
     );
   }
 }
@@ -852,7 +1119,12 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState s) {
     // بعد تعديل Excel في تطبيق آخر والرجوع هنا، يُعاد قراءة الملف تلقائياً.
-    if (s == AppLifecycleState.resumed && !loading) _reload();
+    if (s == AppLifecycleState.resumed && !loading) {
+      Bubble.syncAll().then((_) {
+        if (mounted) setState(() {});
+      });
+      _reload();
+    }
   }
 
   Future<void> _init() async {
@@ -1031,6 +1303,7 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
         '${kindName(kind)}${kind == 'stickers' ? ' (${media.length})' : ''} إلى ${sel.length} جروب$catLabel.${old ? '\nسيتم إغلاق المهمة غير المنتهية السابقة.' : ''}',
         ok: 'ابدأ');
     if (!ok || !mounted) return;
+    await Bubble.reset();
     Store.data['job'] = {
       'kind': kind,
       'text': (kind == 'text' || kind == 'imageText') ? text.text.trim() : '',
@@ -1242,7 +1515,7 @@ class SendScreen extends StatefulWidget {
   State<SendScreen> createState() => _SendScreenState();
 }
 
-class _SendScreenState extends State<SendScreen> {
+class _SendScreenState extends State<SendScreen> with WidgetsBindingObserver {
   late Map<String, dynamic> job;
   int? forced;
   bool opened = false;
@@ -1251,6 +1524,43 @@ class _SendScreenState extends State<SendScreen> {
   void initState() {
     super.initState();
     job = Store.job!;
+    WidgetsBinding.instance.addObserver(this);
+    _sync();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState s) {
+    if (s == AppLifecycleState.resumed) _sync();
+  }
+
+  /// يأخذ ما أنجزته الفقاعة (تم/تخطي) أثناء وجودك في واتساب.
+  Future<void> _sync() async {
+    final r = await Bubble.sync('job');
+    if (r.changed) forced = null;
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _startBubble(int i) async {
+    final media = (job['media'] as List).map((e) => e.toString()).toList();
+    for (final m in media) {
+      if (!File(m).existsSync()) {
+        snack(context, 'ملف الصورة غير موجود، جهزي الرسالة من جديد');
+        return;
+      }
+    }
+    final err = await Bubble.start(jobSession(job), i);
+    if (!mounted) return;
+    if (err != null) {
+      snack(context, err);
+      return;
+    }
+    setState(() => opened = true);
   }
 
   List get _st => job['st'] as List;
@@ -1290,6 +1600,7 @@ class _SendScreenState extends State<SendScreen> {
   Future<void> _mark(int i, String s) async {
     _st[i] = s;
     await Store.save();
+    unawaited(Bubble.setStatus(i, s));
     setState(() {
       forced = null;
       opened = false;
@@ -1304,6 +1615,7 @@ class _SendScreenState extends State<SendScreen> {
       if (!ok) return;
       _st[i] = 'pending';
       await Store.save();
+      unawaited(Bubble.setStatus(i, 'pending'));
     }
     if (mounted) setState(() => forced = i);
   }
@@ -1313,6 +1625,7 @@ class _SendScreenState extends State<SendScreen> {
         'المتبقي: ${_count('pending')} جروب. سيتم إغلاق المهمة.',
         ok: 'إنهاء');
     if (!ok) return;
+    await Bubble.reset();
     job['finished'] = true;
     await Store.save();
     if (mounted) Navigator.pop(context);
@@ -1448,11 +1761,15 @@ class _SendScreenState extends State<SendScreen> {
               ]),
             ),
           ),
-          const SizedBox(height: 16),
-          FilledButton.icon(
+          const SizedBox(height: 8),
+          BubbleCard(
+              startLabel: 'تشغيل الفقاعة من هذا الجروب',
+              onStart: () => _startBubble(i)),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
               onPressed: () => _open(i),
               icon: const Icon(Icons.chat),
-              label: const Text('فتح واتساب بيزنس')),
+              label: const Text('فتح واتساب بيزنس (يدوي)')),
           if (opened)
             Padding(
               padding: const EdgeInsets.only(top: 12),
@@ -1671,6 +1988,676 @@ class _MediaBrowserState extends State<MediaBrowser> {
                   ),
                 ]),
         ),
+      ]),
+    );
+  }
+}
+
+// ======================= تاب: رسالة موحدة لمصنف واتساب =======================
+class LabelTab extends StatefulWidget {
+  const LabelTab({super.key});
+  @override
+  State<LabelTab> createState() => _LabelTabState();
+}
+
+class _LabelTabState extends State<LabelTab> with WidgetsBindingObserver {
+  final TextEditingController text = TextEditingController();
+  String kind = 'text';
+  List<String> media = [];
+  String? label;
+  final Set<String> off = {};
+  int batch = 5;
+  bool ready = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _init();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    text.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState s) {
+    if (s == AppLifecycleState.resumed && ready) {
+      Bubble.syncAll().then((_) {
+        if (mounted) setState(() {});
+      });
+    }
+  }
+
+  Future<void> _init() async {
+    await Store.load();
+    Wa.invalidate();
+    final d = Store.data['draft2'];
+    if (d is Map<String, dynamic>) {
+      kind = (d['kind'] as String?) ?? 'text';
+      if (!kKinds.containsKey(kind)) kind = 'text';
+      text.text = (d['text'] as String?) ?? '';
+      media = ((d['media'] as List?) ?? const [])
+          .map((e) => e.toString())
+          .where((x) => File(x).existsSync())
+          .toList();
+      label = d['label'] as String?;
+      batch = ((d['batch'] as int?) ?? 5).clamp(1, 30).toInt();
+      off
+        ..clear()
+        ..addAll(((d['off'] as List?) ?? const []).map((e) => e.toString()));
+    }
+    if (!mounted) return;
+    setState(() => ready = true);
+  }
+
+  void _save() {
+    Store.data['draft2'] = {
+      'kind': kind,
+      'text': text.text,
+      'media': media,
+      'label': label,
+      'batch': batch,
+      'off': off.toList(),
+    };
+    Store.save();
+  }
+
+  /// المصنف المحدد لو ما زال موجوداً في المصنفات المحفوظة.
+  String? get _label {
+    final l = label;
+    if (l == null) return null;
+    return Wa.cats.containsKey(l) ? l : null;
+  }
+
+  List<String> get _names {
+    final l = _label;
+    if (l == null) return [];
+    return Wa.cats[l] ?? [];
+  }
+
+  List<String> get _chosen => _names.where((n) => !off.contains(n)).toList();
+
+  void _setKind(String k) {
+    setState(() {
+      if ((k == 'stickers') != (kind == 'stickers')) media = [];
+      kind = k;
+      final lim = kLimit[k]!;
+      if (media.length > lim) media = media.sublist(0, lim);
+    });
+    _save();
+  }
+
+  String _firstDir(List<String> c) {
+    for (final d in c) {
+      if (Directory(d).existsSync()) return d;
+    }
+    return kRoot;
+  }
+
+  Future<void> _addMedia(List<String> paths) async {
+    for (final f in paths) {
+      media.add(await persistMedia(f));
+    }
+    if (!mounted) return;
+    setState(() {});
+    _save();
+  }
+
+  Future<void> _gallery() async {
+    if (kLimit[kind]! - media.length <= 0) return;
+    try {
+      final x = await ImagePicker().pickImage(source: ImageSource.gallery);
+      if (x == null) return;
+      await _addMedia([x.path]);
+    } catch (e) {
+      if (mounted) snack(context, 'تعذر فتح معرض الصور: $e');
+    }
+  }
+
+  Future<void> _browse() async {
+    final room = kLimit[kind]! - media.length;
+    if (room <= 0) return;
+    await prepareFolder();
+    if (!mounted) return;
+    final st = kind == 'stickers';
+    final res = await Navigator.push<List<String>>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => MediaBrowser(
+          title: st ? 'اختيار استيكرات' : 'اختيار صورة',
+          storeKey: st ? 'dirSticker' : 'dirImage',
+          fallbackDir: st
+              ? _firstDir([
+                  '$kRoot/Android/media/com.whatsapp.w4b/WhatsApp Business/Media/WhatsApp Business Stickers',
+                  '$kRoot/Download',
+                ])
+              : _firstDir(['$kRoot/DCIM/Camera', '$kRoot/Pictures', '$kRoot/Download']),
+          exts: st ? ['webp'] : ['jpg', 'jpeg', 'png', 'webp'],
+          max: room,
+        ),
+      ),
+    );
+    if (res == null || res.isEmpty) return;
+    await _addMedia(res);
+  }
+
+  String? _validate() {
+    if (kind == 'text' && text.text.trim().isEmpty) return 'اكتبي نص الرسالة';
+    if (kind != 'text' && media.isEmpty) {
+      return kind == 'stickers' ? 'اختاري استيكراً واحداً على الأقل' : 'اختاري صورة';
+    }
+    return null;
+  }
+
+  Future<void> _start() async {
+    final v = _validate();
+    if (v != null) {
+      snack(context, v);
+      return;
+    }
+    final lab = _label;
+    if (lab == null) {
+      snack(context, 'اختاري المصنف أولاً');
+      return;
+    }
+    final sel = _chosen;
+    if (sel.isEmpty) {
+      snack(context, 'لا توجد جروبات محددة في هذا المصنف');
+      return;
+    }
+    final batches = (sel.length / batch).ceil();
+    final old = Store.ujob != null;
+    final ok = await ask(
+        context,
+        'تجهيز الإرسال',
+        '${kindName(kind)}${kind == 'stickers' ? ' (${media.length})' : ''} إلى ${sel.length} جروب من \"$lab\" على $batches دفعة (حتى $batch جروب في الدفعة).'
+        '${old ? '\nسيتم إغلاق المهمة غير المنتهية السابقة.' : ''}',
+        ok: 'ابدأ');
+    if (!ok || !mounted) return;
+    await Bubble.reset();
+    Store.data['ujob'] = {
+      'label': lab,
+      'kind': kind,
+      'text': (kind == 'text' || kind == 'imageText') ? text.text.trim() : '',
+      'media': kind == 'text' ? <String>[] : media,
+      'items': sel,
+      'st': List<String>.filled(sel.length, 'pending'),
+      'batch': batch,
+      'finished': false,
+    };
+    _save();
+    await Store.save();
+    if (!mounted) return;
+    await Navigator.push(
+        context, MaterialPageRoute(builder: (_) => const LabelSendScreen()));
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context);
+    final cats = Wa.cats;
+    final lab = _label;
+    final names = _names;
+    final lim = kLimit[kind]!;
+    final job = Store.ujob;
+    return Scaffold(
+      appBar: AppBar(title: const Text('رسالة موحدة لمصنف')),
+      body: !ready
+          ? const Center(child: CircularProgressIndicator())
+          : ListView(padding: const EdgeInsets.all(16), children: [
+              if (job != null) ...[
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(children: [
+                      Text(
+                          'مهمة مصنف غير منتهية (${job['label']}): ${(job['st'] as List).where((s) => s != 'pending').length} من ${(job['st'] as List).length}'),
+                      const SizedBox(height: 8),
+                      FilledButton(
+                          onPressed: () async {
+                            await Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                    builder: (_) => const LabelSendScreen()));
+                            if (mounted) setState(() {});
+                          },
+                          child: const Text('استكمال الإرسال')),
+                    ]),
+                  ),
+                ),
+                const SizedBox(height: 8),
+              ],
+              const Card(
+                child: Padding(
+                  padding: EdgeInsets.all(12),
+                  child: Text(
+                      'اكتبي الرسالة مرة واحدة واختاري المصنف. التطبيق يرتب جروباته على دفعات، والفقاعة تكتب اسم كل جروب في بحث واتساب، وأنتِ تعلّمين عليه وتضغطين إرسال لكل دفعة.'),
+                ),
+              ),
+              const SizedBox(height: 8),
+              if (cats.isEmpty)
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(children: [
+                      const Text(
+                          'لا توجد مصنفات محفوظة. من شاشة أسماء الجروبات الصقي أسماء جروبات المصنف مع اسم التصنيف.'),
+                      const SizedBox(height: 8),
+                      OutlinedButton.icon(
+                        onPressed: () async {
+                          await Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                  builder: (_) =>
+                                      const WaGroupsScreen(groups: [])));
+                          if (mounted) setState(() {});
+                        },
+                        icon: const Icon(Icons.groups),
+                        label: const Text('إضافة مصنف'),
+                      ),
+                    ]),
+                  ),
+                )
+              else ...[
+                Text('المصنف', style: t.textTheme.titleMedium),
+                const SizedBox(height: 8),
+                Wrap(spacing: 8, runSpacing: 8, children: [
+                  for (final e in cats.entries)
+                    ChoiceChip(
+                      label: Text('${e.key} (${e.value.length})'),
+                      selected: lab == e.key,
+                      onSelected: (_) {
+                        setState(() {
+                          label = e.key;
+                          off.clear();
+                        });
+                        _save();
+                      },
+                    ),
+                ]),
+              ],
+              if (lab != null) ...[
+                const SizedBox(height: 8),
+                Card(
+                  child: ExpansionTile(
+                    title: Text('الجروبات: ${_chosen.length} من ${names.length}'),
+                    subtitle: const Text('اضغطي لاستبعاد جروبات من هذه الرسالة'),
+                    children: [
+                      Row(children: [
+                        TextButton(
+                            onPressed: () {
+                              setState(off.clear);
+                              _save();
+                            },
+                            child: const Text('تحديد الكل')),
+                        TextButton(
+                            onPressed: () {
+                              setState(() => off.addAll(names));
+                              _save();
+                            },
+                            child: const Text('إلغاء الكل')),
+                      ]),
+                      for (final n in names)
+                        CheckboxListTile(
+                          dense: true,
+                          controlAffinity: ListTileControlAffinity.leading,
+                          value: !off.contains(n),
+                          title: Text(n),
+                          onChanged: (v) {
+                            setState(() {
+                              if (v == true) {
+                                off.remove(n);
+                              } else {
+                                off.add(n);
+                              }
+                            });
+                            _save();
+                          },
+                        ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Row(children: [
+                      const Expanded(
+                          child: Text(
+                              'عدد الجروبات في كل دفعة (واتساب يسمح غالباً بـ 5 في المشاركة الواحدة)')),
+                      IconButton(
+                          onPressed: batch > 1
+                              ? () {
+                                  setState(() => batch--);
+                                  _save();
+                                }
+                              : null,
+                          icon: const Icon(Icons.remove_circle_outline)),
+                      Text('$batch', style: t.textTheme.titleLarge),
+                      IconButton(
+                          onPressed: batch < 30
+                              ? () {
+                                  setState(() => batch++);
+                                  _save();
+                                }
+                              : null,
+                          icon: const Icon(Icons.add_circle_outline)),
+                    ]),
+                  ),
+                ),
+              ],
+              const Divider(height: 32),
+              for (final k in kKinds.keys)
+                ListTile(
+                  selected: kind == k,
+                  leading: Icon(kind == k
+                      ? Icons.radio_button_checked
+                      : Icons.radio_button_off),
+                  title: Text(kKinds[k]!, style: t.textTheme.titleMedium),
+                  onTap: () => _setKind(k),
+                ),
+              const Divider(),
+              if (kind == 'text' || kind == 'imageText') ...[
+                const SizedBox(height: 8),
+                TextField(
+                  controller: text,
+                  minLines: 4,
+                  maxLines: 10,
+                  onChanged: (_) => _save(),
+                  decoration: const InputDecoration(
+                      labelText: 'نص الرسالة', border: OutlineInputBorder()),
+                ),
+              ],
+              if (lim > 0) ...[
+                const SizedBox(height: 16),
+                Wrap(spacing: 12, runSpacing: 12, children: [
+                  for (var i = 0; i < media.length; i++)
+                    Stack(children: [
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(12),
+                        child: Container(
+                          width: 120,
+                          height: 120,
+                          color: Colors.black12,
+                          child: Image.file(File(media[i]),
+                              width: 120,
+                              height: 120,
+                              fit: kind == 'stickers'
+                                  ? BoxFit.contain
+                                  : BoxFit.cover,
+                              cacheWidth: 300,
+                              errorBuilder: (_, __, ___) =>
+                                  const Center(child: Icon(Icons.broken_image))),
+                        ),
+                      ),
+                      PositionedDirectional(
+                        top: 0,
+                        end: 0,
+                        child: IconButton.filled(
+                          iconSize: 18,
+                          onPressed: () {
+                            setState(() => media.removeAt(i));
+                            _save();
+                          },
+                          icon: const Icon(Icons.close),
+                        ),
+                      ),
+                    ]),
+                ]),
+                const SizedBox(height: 12),
+                if (media.length < lim) ...[
+                  if (kind != 'stickers') ...[
+                    OutlinedButton.icon(
+                      onPressed: _gallery,
+                      icon: const Icon(Icons.photo_library),
+                      label: const Text('اختيار من معرض الصور'),
+                    ),
+                    const SizedBox(height: 8),
+                  ],
+                  OutlinedButton.icon(
+                    onPressed: _browse,
+                    icon: Icon(kind == 'stickers'
+                        ? Icons.emoji_emotions
+                        : Icons.folder_open),
+                    label: Text(kind == 'stickers'
+                        ? 'إضافة استيكرات (${media.length}) — آخر مجلد محفوظ'
+                        : 'اختيار من مجلد — آخر مجلد محفوظ'),
+                  ),
+                ],
+              ],
+              const SizedBox(height: 24),
+              FilledButton.icon(
+                  onPressed: _start,
+                  icon: const Icon(Icons.play_arrow),
+                  label: const Text('تجهيز الإرسال للمصنف')),
+              const SizedBox(height: 24),
+            ]),
+    );
+  }
+}
+
+class LabelSendScreen extends StatefulWidget {
+  const LabelSendScreen({super.key});
+  @override
+  State<LabelSendScreen> createState() => _LabelSendScreenState();
+}
+
+class _LabelSendScreenState extends State<LabelSendScreen>
+    with WidgetsBindingObserver {
+  late Map<String, dynamic> job;
+  bool started = false;
+
+  @override
+  void initState() {
+    super.initState();
+    job = Store.ujob!;
+    WidgetsBinding.instance.addObserver(this);
+    _sync();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState s) {
+    if (s == AppLifecycleState.resumed) _sync();
+  }
+
+  List get _items => job['items'] as List;
+  List get _st => job['st'] as List;
+  int get _bs => ((job['batch'] as int?) ?? 5).clamp(1, 30).toInt();
+  int _count(String s) => _st.where((x) => x == s).length;
+  List<String> get _media =>
+      (job['media'] as List).map((e) => e.toString()).toList();
+
+  Future<void> _sync() async {
+    await Bubble.sync('ujob');
+    if (mounted) setState(() {});
+  }
+
+  bool _mediaOk() {
+    for (final m in _media) {
+      if (!File(m).existsSync()) {
+        snack(context, 'ملف الصورة غير موجود، جهزي الرسالة من جديد');
+        return false;
+      }
+    }
+    return true;
+  }
+
+  Future<void> _startBubble(int at) async {
+    if (!_mediaOk()) return;
+    final err = await Bubble.start(labelSession(job), at);
+    if (!mounted) return;
+    if (err != null) {
+      snack(context, err);
+      return;
+    }
+    setState(() => started = true);
+  }
+
+  Future<void> _manualShare() async {
+    if (!_mediaOk()) return;
+    try {
+      await _ch.invokeMethod<bool>(
+          'share', {'text': job['text'] as String, 'paths': _media});
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+      snack(
+          context,
+          e.code == 'NO_WA_BUSINESS'
+              ? 'WhatsApp Business غير مثبت على هذا الهاتف'
+              : 'تعذر فتح واتساب: ${e.message}');
+    }
+  }
+
+  Future<void> _setSt(int i, String s) async {
+    _st[i] = s;
+    await Store.save();
+    unawaited(Bubble.setStatus(i, s));
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _finish() async {
+    final ok = await ask(context, 'إنهاء المهمة',
+        'المتبقي: ${_count('pending')} جروب. سيتم إغلاق المهمة والفقاعة.',
+        ok: 'إنهاء');
+    if (!ok) return;
+    await Bubble.reset();
+    job['finished'] = true;
+    await Store.save();
+    if (mounted) Navigator.pop(context);
+  }
+
+  Icon _icon(String s) => s == 'done'
+      ? const Icon(Icons.check_circle, color: Colors.green)
+      : s == 'skipped'
+          ? const Icon(Icons.skip_next, color: Colors.orange)
+          : const Icon(Icons.radio_button_unchecked);
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context);
+    final total = _items.length;
+    final done = _count('done'), skipped = _count('skipped');
+    final cur = _st.indexOf('pending');
+    final bs = _bs;
+    final media = _media;
+    final body = (job['text'] as String).trim();
+    final batches = (total / bs).ceil();
+
+    return Scaffold(
+      appBar: AppBar(title: Text('مصنف: ${job['label']}'), actions: [
+        IconButton(
+            tooltip: 'إنهاء المهمة',
+            onPressed: _finish,
+            icon: const Icon(Icons.stop_circle_outlined)),
+      ]),
+      body: ListView(padding: const EdgeInsets.all(16), children: [
+        LinearProgressIndicator(
+            value: total == 0 ? 0 : (done + skipped) / total, minHeight: 8),
+        const SizedBox(height: 8),
+        Text(
+            'تم $done  •  تخطي $skipped  •  متبقي ${_count('pending')}  (من $total في $batches دفعة)'),
+        const SizedBox(height: 12),
+        if (cur < 0) ...[
+          const SizedBox(height: 12),
+          const Icon(Icons.check_circle, size: 72, color: Colors.green),
+          const SizedBox(height: 12),
+          Text('اكتمل المرور على كل الجروبات',
+              textAlign: TextAlign.center, style: t.textTheme.titleLarge),
+          const SizedBox(height: 16),
+          FilledButton(onPressed: _finish, child: const Text('إنهاء المهمة')),
+        ] else ...[
+          BubbleCard(
+              startLabel:
+                  started ? 'استكمال بالفقاعة' : 'تشغيل الفقاعة من الجروب ${cur + 1}',
+              onStart: () => _startBubble(cur)),
+          const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Text(
+                  'في واتساب: اضغطي الفقاعة فيُكتب اسم الجروب في البحث، علّمي عليه، ثم اضغطي الفقاعة للجروب التالي. '
+                  'بعد آخر جروب في الدفعة اضغطي إرسال في واتساب، ثم الفقاعة لتبدأ الدفعة التالية. '
+                  'اضغطي الفقاعة مطولاً للتخطي أو إعادة الكتابة أو الإغلاق.',
+                  style: t.textTheme.bodyMedium),
+            ),
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+              onPressed: _manualShare,
+              icon: const Icon(Icons.chat),
+              label: const Text('فتح واتساب بالرسالة (يدوي)')),
+        ],
+        const SizedBox(height: 8),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Row(children: [
+              for (final m in media.take(2))
+                Padding(
+                  padding: const EdgeInsetsDirectional.only(end: 8),
+                  child: Image.file(File(m),
+                      width: 48,
+                      height: 48,
+                      cacheWidth: 100,
+                      errorBuilder: (_, __, ___) =>
+                          const Icon(Icons.broken_image)),
+                ),
+              Expanded(
+                  child: Text(
+                      body.isEmpty
+                          ? kindName(job['kind'] as String)
+                          : '${kindName(job['kind'] as String)}: $body',
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis)),
+            ]),
+          ),
+        ),
+        const SizedBox(height: 8),
+        for (var b = 0; b < batches; b++) ...[
+          Padding(
+            padding: const EdgeInsets.only(top: 12, bottom: 4),
+            child: Text('الدفعة ${b + 1}', style: t.textTheme.titleSmall),
+          ),
+          for (var i = b * bs;
+              i < ((b + 1) * bs < total ? (b + 1) * bs : total);
+              i++)
+            ListTile(
+              dense: true,
+              leading: _icon(_st[i] as String),
+              title: Text(_items[i].toString()),
+              onTap: () async {
+                await Clipboard.setData(ClipboardData(text: _items[i].toString()));
+                if (context.mounted) snack(context, 'تم نسخ الاسم');
+              },
+              trailing: PopupMenuButton<String>(
+                onSelected: (v) {
+                  if (v == 'start') {
+                    _startBubble(i);
+                  } else {
+                    _setSt(i, v);
+                  }
+                },
+                itemBuilder: (_) => const [
+                  PopupMenuItem(value: 'start', child: Text('ابدأ الفقاعة من هنا')),
+                  PopupMenuItem(value: 'done', child: Text('تعليم: تم')),
+                  PopupMenuItem(value: 'skipped', child: Text('تعليم: تخطي')),
+                  PopupMenuItem(value: 'pending', child: Text('إعادته للمعلّق')),
+                ],
+              ),
+            ),
+        ],
+        const SizedBox(height: 24),
       ]),
     );
   }
