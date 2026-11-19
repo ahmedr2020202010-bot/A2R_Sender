@@ -401,6 +401,144 @@ Future<String> persistMedia(String src) async {
   return dest;
 }
 
+/// اختيار نسخة واتساب المستهدفة (بيزنس أو العادي).
+class WaApp {
+  static const String business = 'com.whatsapp.w4b';
+  static const String normal = 'com.whatsapp';
+
+  static String get pkg =>
+      Store.data['waPkg'] == normal ? normal : business;
+
+  static bool get isNormal => pkg == normal;
+
+  static String get label => isNormal ? 'واتساب العادي' : 'واتساب بيزنس';
+
+  static Future<void> setPkg(String p) async {
+    Store.data['waPkg'] = p == normal ? normal : business;
+    await Store.save();
+  }
+
+  static List<String> stickerDirs() => isNormal
+      ? [
+          '$kRoot/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Stickers',
+          '$kRoot/WhatsApp/Media/WhatsApp Stickers',
+          '$kRoot/Android/media/com.whatsapp.w4b/WhatsApp Business/Media/WhatsApp Business Stickers',
+          '$kRoot/Download',
+        ]
+      : [
+          '$kRoot/Android/media/com.whatsapp.w4b/WhatsApp Business/Media/WhatsApp Business Stickers',
+          '$kRoot/WhatsApp Business/Media/WhatsApp Business Stickers',
+          '$kRoot/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Stickers',
+          '$kRoot/Download',
+        ];
+}
+
+/// حذف الصور والاستيكرات المؤقتة غير المستخدمة في أي مسودة أو مهمة نشطة.
+Future<({int count, int bytes})> cleanupUnusedMedia() async {
+  try {
+    final dir = Directory(
+        p.join((await getApplicationSupportDirectory()).path, 'media'));
+    if (!dir.existsSync()) return (count: 0, bytes: 0);
+    final keep = <String>{};
+    void collect(dynamic obj) {
+      if (obj is Map) {
+        final m = obj['media'];
+        if (m is List) {
+          for (final x in m) {
+            keep.add(x.toString());
+          }
+        }
+      }
+    }
+    collect(Store.data['draft']);
+    collect(Store.data['draft2']);
+    collect(Store.job);
+    collect(Store.ujob);
+
+    var count = 0;
+    var bytes = 0;
+    for (final e in dir.listSync(followLinks: false)) {
+      if (e is File && !keep.contains(e.path)) {
+        try {
+          bytes += e.lengthSync();
+          e.deleteSync();
+          count++;
+        } catch (_) {}
+      }
+    }
+    return (count: count, bytes: bytes);
+  } catch (_) {
+    return (count: 0, bytes: 0);
+  }
+}
+
+/// نافذة الإعدادات السريعة: اختيار نسخة واتساب + تنظيف الملفات المؤقتة.
+Future<void> showAppSettings(BuildContext context, VoidCallback onChanged) async {
+  await showModalBottomSheet<void>(
+    context: context,
+    showDragHandle: true,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setModal) {
+        final t = Theme.of(ctx);
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 4, 16, 20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text('إعدادات التطبيق', style: t.textTheme.titleLarge),
+                const SizedBox(height: 16),
+                Text('نسخة واتساب المستخدمة في الإرسال:',
+                    style: t.textTheme.titleSmall),
+                const SizedBox(height: 8),
+                SegmentedButton<String>(
+                  segments: const [
+                    ButtonSegment(
+                      value: WaApp.business,
+                      label: Text('واتساب بيزنس'),
+                      icon: Icon(Icons.business),
+                    ),
+                    ButtonSegment(
+                      value: WaApp.normal,
+                      label: Text('واتساب العادي'),
+                      icon: Icon(Icons.chat),
+                    ),
+                  ],
+                  selected: {WaApp.pkg},
+                  onSelectionChanged: (v) async {
+                    await WaApp.setPkg(v.first);
+                    setModal(() {});
+                    onChanged();
+                  },
+                ),
+                const SizedBox(height: 16),
+                const Divider(),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    final r = await cleanupUnusedMedia();
+                    if (!ctx.mounted) return;
+                    Navigator.pop(ctx);
+                    final mb = (r.bytes / (1024 * 1024)).toStringAsFixed(2);
+                    snack(
+                        context,
+                        r.count == 0
+                            ? 'لا توجد ملفات مؤقتة زائدة'
+                            : 'تم مسح ${r.count} ملف مؤقت ($mb ميجابايت)');
+                  },
+                  icon: const Icon(Icons.cleaning_services_outlined),
+                  label: const Text('تنظيف الصور والاستيكرات المؤقتة'),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    ),
+  );
+}
+
 void snack(BuildContext c, String m) => ScaffoldMessenger.of(c)
   ..hideCurrentSnackBar()
   ..showSnackBar(SnackBar(content: Text(m)));
@@ -885,6 +1023,7 @@ Map<String, dynamic> jobSession(Map<String, dynamic> job,
   return {
     'id': 'job',
     'mode': mode,
+    'pkg': WaApp.pkg,
     'text': job['text'] as String,
     'media': (job['media'] as List).map((e) => e.toString()).toList(),
     'items': List.generate(gs.length, (i) {
@@ -908,6 +1047,7 @@ Map<String, dynamic> labelSession(Map<String, dynamic> job,
   return {
     'id': 'ujob',
     'mode': mode,
+    'pkg': WaApp.pkg,
     'text': job['text'] as String,
     'media': (job['media'] as List).map((e) => e.toString()).toList(),
     'items': List.generate(names.length, (i) => {
@@ -1315,6 +1455,7 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
           .where((x) => File(x).existsSync())
           .toList();
     }
+    unawaited(cleanupUnusedMedia());
     await _reload();
   }
 
@@ -1451,11 +1592,7 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
           title: st ? 'اختيار استيكرات' : 'اختيار صورة',
           storeKey: st ? 'dirSticker' : 'dirImage',
           fallbackDir: st
-              ? _firstDir([
-                  '$kRoot/Android/media/com.whatsapp.w4b/WhatsApp Business/Media/WhatsApp Business Stickers',
-                  '$kRoot/WhatsApp Business/Media/WhatsApp Business Stickers',
-                  '$kRoot/Download',
-                ])
+              ? _firstDir(WaApp.stickerDirs())
               : _firstDir(['$kRoot/DCIM/Camera', '$kRoot/Pictures', '$kRoot/Download']),
           exts: st ? ['webp', 'png', 'gif'] : ['jpg', 'jpeg', 'png', 'webp'],
           max: room,
@@ -1513,7 +1650,13 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
     final job = Store.job;
     final lim = kLimit[kind]!;
     return Scaffold(
-      appBar: AppBar(title: const Text('A2R Sender'), actions: [
+      appBar: AppBar(title: Text('A2R Sender • ${WaApp.label}'), actions: [
+        IconButton(
+            tooltip: 'إعدادات التطبيق',
+            onPressed: () => showAppSettings(context, () {
+                  if (mounted) setState(() {});
+                }),
+            icon: const Icon(Icons.settings)),
         IconButton(
             tooltip: 'أسماء الجروبات من واتساب',
             onPressed: () => Navigator.push(
@@ -1795,15 +1938,15 @@ class _SendScreenState extends State<SendScreen> with WidgetsBindingObserver {
     }
     await Clipboard.setData(ClipboardData(text: waKey(_g(i))));
     try {
-      await _ch.invokeMethod<bool>(
-          'share', {'text': job['text'] as String, 'paths': media});
+      await _ch.invokeMethod<bool>('share',
+          {'text': job['text'] as String, 'paths': media, 'pkg': WaApp.pkg});
       if (mounted) setState(() => opened = true);
     } on PlatformException catch (e) {
       if (!mounted) return;
       snack(
           context,
           e.code == 'NO_WA_BUSINESS'
-              ? 'WhatsApp Business غير مثبت على هذا الهاتف'
+              ? '${WaApp.label} غير مثبت على هذا الهاتف'
               : 'تعذر فتح واتساب: ${e.message}');
     }
   }
@@ -1839,6 +1982,7 @@ class _SendScreenState extends State<SendScreen> with WidgetsBindingObserver {
     await Bubble.reset();
     job['finished'] = true;
     await Store.save();
+    unawaited(cleanupUnusedMedia());
     if (mounted) Navigator.pop(context);
   }
 
@@ -2017,7 +2161,7 @@ class _SendScreenState extends State<SendScreen> with WidgetsBindingObserver {
           OutlinedButton.icon(
               onPressed: () => _open(i),
               icon: const Icon(Icons.chat),
-              label: const Text('فتح واتساب بيزنس (يدوي)')),
+              label: Text('فتح ${WaApp.label} (يدوي)')),
           if (opened)
             Padding(
               padding: const EdgeInsets.only(top: 12),
@@ -2476,11 +2620,7 @@ class _LabelTabState extends State<LabelTab> with WidgetsBindingObserver {
           title: st ? 'اختيار استيكرات' : 'اختيار صورة',
           storeKey: st ? 'dirSticker' : 'dirImage',
           fallbackDir: st
-              ? _firstDir([
-                  '$kRoot/Android/media/com.whatsapp.w4b/WhatsApp Business/Media/WhatsApp Business Stickers',
-                  '$kRoot/WhatsApp Business/Media/WhatsApp Business Stickers',
-                  '$kRoot/Download',
-                ])
+              ? _firstDir(WaApp.stickerDirs())
               : _firstDir(['$kRoot/DCIM/Camera', '$kRoot/Pictures', '$kRoot/Download']),
           exts: st ? ['webp', 'png', 'gif'] : ['jpg', 'jpeg', 'png', 'webp'],
           max: room,
@@ -2552,7 +2692,14 @@ class _LabelTabState extends State<LabelTab> with WidgetsBindingObserver {
     final lim = kLimit[kind]!;
     final job = Store.ujob;
     return Scaffold(
-      appBar: AppBar(title: const Text('رسالة موحدة لمصنف')),
+      appBar: AppBar(title: const Text('رسالة موحدة لمصنف'), actions: [
+        IconButton(
+            tooltip: 'إعدادات التطبيق',
+            onPressed: () => showAppSettings(context, () {
+                  if (mounted) setState(() {});
+                }),
+            icon: const Icon(Icons.settings)),
+      ]),
       body: !ready
           ? const Center(child: CircularProgressIndicator())
           : ListView(padding: const EdgeInsets.all(16), children: [
@@ -2853,14 +3000,14 @@ class _LabelSendScreenState extends State<LabelSendScreen>
   Future<void> _manualShare() async {
     if (!_mediaOk()) return;
     try {
-      await _ch.invokeMethod<bool>(
-          'share', {'text': job['text'] as String, 'paths': _media});
+      await _ch.invokeMethod<bool>('share',
+          {'text': job['text'] as String, 'paths': _media, 'pkg': WaApp.pkg});
     } on PlatformException catch (e) {
       if (!mounted) return;
       snack(
           context,
           e.code == 'NO_WA_BUSINESS'
-              ? 'WhatsApp Business غير مثبت على هذا الهاتف'
+              ? '${WaApp.label} غير مثبت على هذا الهاتف'
               : 'تعذر فتح واتساب: ${e.message}');
     }
   }
@@ -2880,6 +3027,7 @@ class _LabelSendScreenState extends State<LabelSendScreen>
     await Bubble.reset();
     job['finished'] = true;
     await Store.save();
+    unawaited(cleanupUnusedMedia());
     if (mounted) Navigator.pop(context);
   }
 
