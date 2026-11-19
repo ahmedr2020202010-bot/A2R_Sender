@@ -126,7 +126,8 @@ jobs:
                                   "share" -> {
                                       val text = call.argument<String>("text") ?: ""
                                       val paths = call.argument<List<String>>("paths") ?: emptyList()
-                                      ShareUtil.send(this, text, paths, false)
+                                      val pkg = call.argument<String>("pkg") ?: ShareUtil.BUSINESS
+                                      ShareUtil.send(this, text, paths, false, pkg)
                                       result.success(true)
                                   }
                                   "permStatus" -> {
@@ -225,6 +226,7 @@ jobs:
           class Sess(
               val id: String,
               val mode: String,
+              val pkg: String,
               val text: String,
               val media: List<String>,
               val items: List<SItem>,
@@ -235,6 +237,7 @@ jobs:
                   val o = JSONObject()
                   o.put("id", id)
                   o.put("mode", mode)
+                  o.put("pkg", pkg)
                   o.put("text", text)
                   o.put("media", JSONArray(media))
                   val a = JSONArray()
@@ -285,9 +288,12 @@ jobs:
                               )
                           )
                       }
+                      val rawPkg = o.optString("pkg", ShareUtil.BUSINESS)
+                      val pkg = if (rawPkg == ShareUtil.NORMAL) ShareUtil.NORMAL else ShareUtil.BUSINESS
                       return Sess(
                           o.optString("id", "job"),
                           o.optString("mode", "review"),
+                          pkg,
                           o.optString("text", ""),
                           media,
                           items,
@@ -310,6 +316,7 @@ jobs:
 
           object ShareUtil {
               const val BUSINESS = "com.whatsapp.w4b"
+              const val NORMAL = "com.whatsapp"
 
               private fun mimeOf(path: String): String {
                   val p = path.lowercase()
@@ -321,14 +328,21 @@ jobs:
                   }
               }
 
-              /** يفتح شاشة المشاركة في واتساب بيزنس. newTask = true عند الاستدعاء من خدمة (وليس من Activity). */
-              fun send(ctx: Context, text: String, paths: List<String>, newTask: Boolean) {
+              /** يفتح شاشة المشاركة في واتساب المحدد. newTask = true عند الاستدعاء من خدمة. */
+              fun send(
+                  ctx: Context,
+                  text: String,
+                  paths: List<String>,
+                  newTask: Boolean,
+                  pkg: String = BUSINESS
+              ) {
+                  val target = if (pkg == NORMAL) NORMAL else BUSINESS
                   val uris = ArrayList<Uri>()
                   for (p in paths) {
                       uris.add(FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", File(p)))
                   }
                   val intent = Intent()
-                  intent.setPackage(BUSINESS)
+                  intent.setPackage(target)
                   when {
                       uris.isEmpty() -> {
                           intent.action = Intent.ACTION_SEND
@@ -350,14 +364,15 @@ jobs:
                   }
                   intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                   if (newTask) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                  for (u in uris) ctx.grantUriPermission(BUSINESS, u, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  for (u in uris) ctx.grantUriPermission(target, u, Intent.FLAG_GRANT_READ_URI_PERMISSION)
                   ctx.startActivity(intent)
               }
 
-              /** يفتح القائمة الرئيسية في واتساب بيزنس للبحث والمراجعة قبل تجهيز الرسالة. */
-              fun openMain(ctx: Context) {
-                  val intent = ctx.packageManager.getLaunchIntentForPackage(BUSINESS)
-                      ?: throw ActivityNotFoundException("WhatsApp Business غير مثبت")
+              /** يفتح القائمة الرئيسية في واتساب المحدد للبحث والمراجعة قبل تجهيز الرسالة. */
+              fun openMain(ctx: Context, pkg: String = BUSINESS) {
+                  val target = if (pkg == NORMAL) NORMAL else BUSINESS
+                  val intent = ctx.packageManager.getLaunchIntentForPackage(target)
+                      ?: throw ActivityNotFoundException("واتساب غير مثبت")
                   intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                   ctx.startActivity(intent)
               }
@@ -393,18 +408,15 @@ jobs:
           import android.widget.TextView
 
           /**
-           * خدمة إمكانية الوصول (مقصورة على واتساب بيزنس) + الشريط العائم.
-           * - وضع المراجعة (review): يفتح القائمة الرئيسية في واتساب، يبحث برقم الجروب لتتأكد من بياناته،
-           *   وعند الضغط على "تجهيز" يضع النص مباشرة في خانة الكتابة داخل الجروب (أو يفتح المشاركة للصور/الاستيكرات).
-           * - الوضع السريع (share): يفتح شاشة المشاركة مباشرة ويبحث برقم الجروب.
-           * الخدمة لا تضغط على الجروب ولا تضغط على زر الإرسال أبداً.
+           * خدمة إمكانية الوصول (مقصورة على واتساب / واتساب بيزنس) + الشريط العائم.
+           * تعتمد على الاستجابة الفورية لتغيرات الشاشة (onAccessibilityEvent) مع مؤقت احتياطي
+           * لسرعة وثبات أعلى في البحث وتجهيز الرسالة.
            */
           class BubbleService : AccessibilityService() {
 
               companion object {
                   @Volatile
                   var inst: BubbleService? = null
-                  const val WA = "com.whatsapp.w4b"
                   const val PREFS = "a2r_bubble"
 
                   fun stateOf(ctx: Context): String? {
@@ -444,6 +456,17 @@ jobs:
               private var noteText: String? = null
               private var lastAct = 0L
 
+              // حالة البحث النشط (تُغذّى فورياً من onAccessibilityEvent + مؤقت احتياطي)
+              private var pActive = false
+              private var pToken = 0
+              private var pKey = ""
+              private var pMode = "review"
+              private var pAttempt = 0
+              private var pClicked = false
+              private var pBacks = 0
+              private var pLastStep = 0L
+              private var pRunnable: Runnable? = null
+
               private var downX = 0f
               private var downY = 0f
               private var startX = 0
@@ -456,6 +479,7 @@ jobs:
               }
 
               private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+              private fun targetPkg(): String = sess?.pkg ?: ShareUtil.BUSINESS
 
               // ---------------------------------------------------------------- دورة حياة الخدمة
 
@@ -465,7 +489,14 @@ jobs:
                   wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
               }
 
-              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  if (!pActive) return
+                  val pkg = event?.packageName?.toString() ?: return
+                  if (pkg != targetPkg()) return
+                  val now = System.currentTimeMillis()
+                  if (now - pLastStep < 180L) return
+                  h.post { stepSearch(pToken, true) }
+              }
 
               override fun onInterrupt() {}
 
@@ -486,6 +517,13 @@ jobs:
               private fun save() {
                   val s = sess ?: return
                   getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("sess", s.toJson()).apply()
+              }
+
+              private fun cancelSearch() {
+                  pActive = false
+                  pRunnable?.let { h.removeCallbacks(it) }
+                  pRunnable = null
+                  token++
               }
 
               /** يبدأ الجلسة ويفتح العنصر at (أو أول معلّق) فوراً. */
@@ -524,7 +562,7 @@ jobs:
               private fun advance(st: Int) {
                   val s = sess ?: return
                   val now = System.currentTimeMillis()
-                  if (now - lastAct < 650) return
+                  if (now - lastAct < 550) return
                   lastAct = now
                   if (s.idx < 0 || s.idx >= s.items.size) {
                       stopSession()
@@ -536,13 +574,14 @@ jobs:
                   noteText = null
                   save()
                   if (s.idx < 0) {
+                      cancelSearch()
                       render()
                   } else {
                       openCurrent(false)
                   }
               }
 
-              /** يفتح واتساب حسب الوضع (مراجعة في الرئيسية أو مشاركة مباشرة) ثم يكتب كلمة البحث. */
+              /** يفتح واتساب حسب الوضع (مراجعة في الرئيسية أو مشاركة مباشرة) ثم يبدأ البحث الفوري. */
               private fun openCurrent(force: Boolean) {
                   val s = sess ?: return
                   val item = s.items.getOrNull(s.idx)
@@ -552,39 +591,39 @@ jobs:
                   }
                   noteText = null
                   render()
-                  token++
-                  val my = token
+                  cancelSearch()
+                  val pkg = s.pkg
                   if (s.mode == "review") {
-                      var delay = 250L
+                      var delay = 150L
                       val curPkg = rootInActiveWindow?.packageName?.toString()
-                      if (force || curPkg != WA) {
+                      if (force || curPkg != pkg) {
                           try {
-                              ShareUtil.openMain(this)
-                              delay = 1100L
+                              ShareUtil.openMain(this, pkg)
+                              delay = 650L
                           } catch (e: ActivityNotFoundException) {
-                              note("واتساب بيزنس غير مثبت")
+                              note("واتساب غير مثبت")
                               return
                           } catch (e: Exception) {
                               note("تعذر فتح واتساب")
                               return
                           }
                       }
-                      h.postDelayed({ fillMainSearch(item.key, my, 0, false, 0) }, delay)
+                      beginSearch(item.key, "review", delay)
                   } else {
-                      var delay = 0L
+                      var delay = 150L
                       if (item.launch || force) {
                           try {
-                              ShareUtil.send(this, s.text, s.media, true)
-                              delay = 1300L
+                              ShareUtil.send(this, s.text, s.media, true, pkg)
+                              delay = 800L
                           } catch (e: ActivityNotFoundException) {
-                              note("واتساب بيزنس غير مثبت")
+                              note("واتساب غير مثبت")
                               return
                           } catch (e: Exception) {
                               note("تعذر فتح واتساب")
                               return
                           }
                       }
-                      h.postDelayed({ fillShareSearch(item.key, my, 0, false) }, delay)
+                      beginSearch(item.key, "share", delay)
                   }
               }
 
@@ -593,14 +632,13 @@ jobs:
                   val s = sess ?: return
                   val item = s.items.getOrNull(s.idx) ?: return
                   val now = System.currentTimeMillis()
-                  if (now - lastAct < 650) return
+                  if (now - lastAct < 550) return
                   lastAct = now
-                  token++
-                  val my = token
+                  cancelSearch()
 
                   if (s.media.isEmpty()) {
                       val root = rootInActiveWindow
-                      if (root != null && root.packageName?.toString() == WA) {
+                      if (root != null && root.packageName?.toString() == s.pkg) {
                           val input = findChatInput(root)
                           if (input != null) {
                               val args = Bundle()
@@ -619,11 +657,11 @@ jobs:
                       note("افتح المحادثة أولاً (النص منسوخ)")
                   } else {
                       try {
-                          ShareUtil.send(this, s.text, s.media, true)
+                          ShareUtil.send(this, s.text, s.media, true, s.pkg)
                           note("جاري فتح المشاركة...")
-                          h.postDelayed({ fillShareSearch(item.key, my, 0, false) }, 1200L)
+                          beginSearch(item.key, "share", 750L)
                       } catch (e: ActivityNotFoundException) {
-                          note("واتساب بيزنس غير مثبت")
+                          note("واتساب غير مثبت")
                       } catch (e: Exception) {
                           note("تعذر فتح المشاركة")
                       }
@@ -634,98 +672,102 @@ jobs:
               private fun retype() {
                   val s = sess ?: return
                   val item = s.items.getOrNull(s.idx) ?: return
-                  token++
-                  val my = token
-                  if (s.mode == "review") {
-                      fillMainSearch(item.key, my, 0, false, 0)
-                  } else {
-                      fillShareSearch(item.key, my, 0, false)
-                  }
+                  cancelSearch()
+                  beginSearch(item.key, s.mode, 100L)
               }
 
-              // ---------------------------------------------------------------- البحث في القائمة الرئيسية (وضع المراجعة)
+              // ---------------------------------------------------------------- محرك البحث السريع (Event-Driven + Fallback)
 
-              private fun fillMainSearch(
-                  key: String,
-                  my: Int,
-                  attempt: Int,
-                  clickedSearch: Boolean,
-                  backs: Int
-              ) {
-                  if (my != token) return
-                  if (attempt > 28) {
-                      copyClip(key)
+              private fun beginSearch(key: String, mode: String, initialDelay: Long) {
+                  token++
+                  pToken = token
+                  pKey = key
+                  pMode = mode
+                  pAttempt = 0
+                  pClicked = false
+                  pBacks = 0
+                  pLastStep = 0L
+                  pActive = true
+                  scheduleStep(pToken, initialDelay)
+              }
+
+              private fun scheduleStep(my: Int, delayMs: Long) {
+                  pRunnable?.let { h.removeCallbacks(it) }
+                  val r = Runnable { stepSearch(my, false) }
+                  pRunnable = r
+                  h.postDelayed(r, delayMs)
+              }
+
+              private fun stepSearch(my: Int, fromEvent: Boolean) {
+                  if (!pActive || my != pToken) return
+                  val pkg = targetPkg()
+                  val maxAttempts = if (pMode == "review") 24 else 22
+                  if (pAttempt > maxAttempts) {
+                      pActive = false
+                      copyClip(pKey)
                       note("لم أجد البحث — الرقم منسوخ")
                       return
                   }
-                  var clicked = clickedSearch
-                  var bCount = backs
+                  pLastStep = System.currentTimeMillis()
+                  if (!fromEvent) pAttempt++
+
                   val root = rootInActiveWindow
-                  if (root != null && root.packageName?.toString() == WA) {
-                      val f = findSearchField(root, false)
-                      if (f != null) {
-                          val args = Bundle()
-                          args.putCharSequence(
-                              AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                              key
-                          )
-                          f.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-                          if (f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
-                              note("✓ افتح الجروب للتأكد ثم اضغط تجهيز")
-                              return
+                  if (root != null && root.packageName?.toString() == pkg) {
+                      if (pMode == "review") {
+                          val f = findSearchField(root, false)
+                          if (f != null) {
+                              val args = Bundle()
+                              args.putCharSequence(
+                                  AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                                  pKey
+                              )
+                              f.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                              if (f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+                                  pActive = false
+                                  note("✓ افتح الجروب للتأكد ثم اضغط تجهيز")
+                                  return
+                              }
+                          } else {
+                              val inChat = findChatInput(root) != null
+                              if (inChat && pBacks < 3) {
+                                  performGlobalAction(GLOBAL_ACTION_BACK)
+                                  pBacks++
+                                  pClicked = false
+                                  scheduleStep(my, 420L)
+                                  return
+                              }
+                              val b = findSearchButton(root)
+                              if (b != null && (!pClicked || pAttempt % 4 == 3)) {
+                                  if (clickNode(b)) pClicked = true
+                              } else if (b == null && pAttempt >= 2 && pAttempt % 3 == 2 && pBacks < 3) {
+                                  performGlobalAction(GLOBAL_ACTION_BACK)
+                                  pBacks++
+                                  pClicked = false
+                                  scheduleStep(my, 420L)
+                                  return
+                              }
                           }
                       } else {
-                          val inChat = findChatInput(root) != null
-                          if (inChat && bCount < 3) {
-                              performGlobalAction(GLOBAL_ACTION_BACK)
-                              bCount++
-                              h.postDelayed({ fillMainSearch(key, my, attempt + 1, false, bCount) }, 500)
-                              return
-                          }
-                          val b = findSearchButton(root)
-                          if (b != null && (!clicked || attempt % 5 == 4)) {
-                              if (clickNode(b)) clicked = true
-                          } else if (b == null && attempt >= 3 && attempt % 4 == 3 && bCount < 3) {
-                              performGlobalAction(GLOBAL_ACTION_BACK)
-                              bCount++
-                              h.postDelayed({ fillMainSearch(key, my, attempt + 1, false, bCount) }, 500)
-                              return
+                          val f = findSearchField(root, pAttempt >= 8)
+                          if (f != null) {
+                              val args = Bundle()
+                              args.putCharSequence(
+                                  AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                                  pKey
+                              )
+                              f.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                              if (f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+                                  pActive = false
+                                  note("✓ كُتب في البحث")
+                                  return
+                              }
+                          } else if (!pClicked || pAttempt % 5 == 4) {
+                              val b = findSearchButton(root)
+                              if (b != null && clickNode(b)) pClicked = true
                           }
                       }
                   }
-                  h.postDelayed({ fillMainSearch(key, my, attempt + 1, clicked, bCount) }, 350)
-              }
-
-              // ---------------------------------------------------------------- البحث في شاشة المشاركة
-
-              private fun fillShareSearch(key: String, my: Int, attempt: Int, clickedSearch: Boolean) {
-                  if (my != token) return
-                  if (attempt > 26) {
-                      copyClip(key)
-                      note("لم أجد البحث — الكلمة منسوخة")
-                      return
-                  }
-                  var clicked = clickedSearch
-                  val root = rootInActiveWindow
-                  if (root != null && root.packageName?.toString() == WA) {
-                      val f = findSearchField(root, attempt >= 10)
-                      if (f != null) {
-                          val args = Bundle()
-                          args.putCharSequence(
-                              AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                              key
-                          )
-                          f.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-                          if (f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
-                              note("✓ كُتب في البحث")
-                              return
-                          }
-                      } else if (!clicked || attempt % 6 == 5) {
-                          val b = findSearchButton(root)
-                          if (b != null && clickNode(b)) clicked = true
-                      }
-                  }
-                  h.postDelayed({ fillShareSearch(key, my, attempt + 1, clicked) }, 350)
+                  scheduleStep(my, 320L)
               }
 
               // ---------------------------------------------------------------- أدوات التعرف على الحقول
@@ -840,7 +882,7 @@ jobs:
                   val done = s.items.count { x -> x.st != 0 }
                   if (s.idx < 0 || s.idx >= total) {
                       a.text = "اكتمل ✓ ($done/$total)"
-                      b.text = "اضغط التالي للإغلاق"
+                      b.text = "اضغط إغلاق"
                       btnPrep?.visibility = View.GONE
                       btnNext?.text = "إغلاق ✓"
                   } else {
@@ -1092,12 +1134,11 @@ jobs:
                   card.addView(btn("فتح المشاركة بالرسالة مباشرة") {
                       hidePanel()
                       try {
-                          ShareUtil.send(this, s.text, s.media, true)
+                          cancelSearch()
+                          ShareUtil.send(this, s.text, s.media, true, s.pkg)
                           val key = cur?.key ?: ""
                           if (key.isNotEmpty()) {
-                              token++
-                              val my = token
-                              h.postDelayed({ fillShareSearch(key, my, 0, false) }, 1200L)
+                              beginSearch(key, "share", 750L)
                           }
                       } catch (e: Exception) {
                           note("تعذر فتح المشاركة")
@@ -1133,8 +1174,8 @@ jobs:
               }
 
               private fun hideAll() {
+                  cancelSearch()
                   h.removeCallbacksAndMessages(null)
-                  token++
                   hidePanel()
                   val b = bubble
                   if (b != null) {
@@ -1156,12 +1197,12 @@ jobs:
           cat > android/app/src/main/res/xml/a2r_a11y.xml <<'XML'
           <?xml version="1.0" encoding="utf-8"?>
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
               android:accessibilityFeedbackType="feedbackGeneric"
               android:accessibilityFlags="flagReportViewIds"
               android:canRetrieveWindowContent="true"
-              android:notificationTimeout="100"
-              android:packageNames="com.whatsapp.w4b"
+              android:notificationTimeout="150"
+              android:packageNames="com.whatsapp.w4b,com.whatsapp"
               android:description="@string/a2r_a11y_desc" />
           XML
           cat > android/app/src/main/res/values/a2r_strings.xml <<'XML'
@@ -1184,7 +1225,7 @@ jobs:
               '    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n'
               '    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>\n'
               '    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>\n'
-              '    <queries><package android:name="com.whatsapp.w4b"/></queries>\n'
+              '    <queries><package android:name="com.whatsapp.w4b"/><package android:name="com.whatsapp"/></queries>\n'
           )
           provider = (
               '        <provider android:name="androidx.core.content.FileProvider"\n'
