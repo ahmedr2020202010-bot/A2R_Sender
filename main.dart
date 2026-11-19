@@ -11,7 +11,6 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:image_picker/image_picker.dart' show ImagePicker, ImageSource;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
-import 'package:permission_handler/permission_handler.dart';
 
 // ======================= الإعدادات =======================
 const String kRoot = '/storage/emulated/0';
@@ -335,15 +334,11 @@ String? findExcel() {
   }
 }
 
-/// ينشئ المجلد وينسخ ملف Excel أول مرة فقط. يرجع نص الخطأ أو null.
+/// يتأكد من صلاحية الملفات وينشئ المجلد. يرجع نص الخطأ أو null.
 Future<String?> prepareFolder() async {
-  if (!await Permission.storage.isGranted &&
-      !await Permission.manageExternalStorage.isGranted) {
-    await Permission.storage.request();
-    if (!await Permission.storage.isGranted &&
-        !await Permission.manageExternalStorage.isGranted) {
-      await Permission.manageExternalStorage.request();
-    }
+  final s = await Perm.status();
+  if (s.isNotEmpty && s['storage'] != true) {
+    return 'صلاحية الملفات غير ممنوحة.\nاسمحي للتطبيق بالوصول إلى كل الملفات ثم اضغطي تحديث.';
   }
   if (await _tryPrepare()) return null;
   return 'لا أستطيع الوصول إلى المجلد $kDir\nاسمحي للتطبيق بالوصول إلى الملفات من إعدادات الهاتف ثم اضغطي تحديث.';
@@ -1001,6 +996,174 @@ class _BubbleCardState extends State<BubbleCard> with WidgetsBindingObserver {
   }
 }
 
+// ======================= الصلاحيات عند بداية التشغيل =======================
+class Perm {
+  static Future<Map<String, dynamic>> status() async {
+    try {
+      final r = await _ch.invokeMethod<Map>('permStatus');
+      return (r ?? {}).map((k, v) => MapEntry(k.toString(), v));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  static Future<void> reqStorage() async {
+    try {
+      await _ch.invokeMethod<bool>('reqStorage');
+    } catch (_) {}
+  }
+}
+
+/// شاشة البداية: تطلب الصلاحيات واحدة واحدة (الملفات ← العرض فوق التطبيقات ← خدمة إمكانية الوصول)
+/// ثم تفتح التطبيق. تعمل على أندرويد 10 حتى 16.
+class Gate extends StatefulWidget {
+  const Gate({super.key});
+  @override
+  State<Gate> createState() => _GateState();
+}
+
+class _GateState extends State<Gate> with WidgetsBindingObserver {
+  Map<String, dynamic> st = {};
+  bool checked = false, skipped = false, entered = false, busy = false;
+  final Set<String> asked = {};
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _refresh();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState s) {
+    if (s == AppLifecycleState.resumed) _refresh();
+  }
+
+  bool _ok(String k) => st[k] == true;
+  bool get _all => _ok('storage') && _ok('overlay') && _ok('a11y');
+
+  Future<void> _refresh() async {
+    if (busy) return;
+    busy = true;
+    try {
+      final r = await Perm.status();
+      if (!mounted) return;
+      setState(() {
+        st = r;
+        checked = true;
+      });
+      if (r.isEmpty || _all || skipped || entered) return;
+      // يطلب تلقائياً أول صلاحية ناقصة (مرة واحدة لكل صلاحية)، والباقي بالأزرار.
+      for (final k in const ['storage', 'overlay', 'a11y']) {
+        if (!_ok(k) && asked.add(k)) {
+          await Future<void>.delayed(const Duration(milliseconds: 400));
+          if (mounted) await _request(k);
+          break;
+        }
+      }
+    } finally {
+      busy = false;
+    }
+  }
+
+  Future<void> _request(String k) async {
+    if (k == 'storage') {
+      await Perm.reqStorage();
+    } else if (k == 'overlay') {
+      await Bubble.open('openOverlay');
+    } else {
+      await Bubble.open('openA11y');
+    }
+  }
+
+  Widget _item(ThemeData t, String k, String title, String why, String btn) {
+    final ok = _ok(k);
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Icon(ok ? Icons.check_circle : Icons.error_outline,
+                color: ok ? Colors.green : t.colorScheme.error),
+            const SizedBox(width: 8),
+            Expanded(child: Text(title, style: t.textTheme.titleMedium)),
+          ]),
+          const SizedBox(height: 6),
+          Text(why),
+          if (!ok) ...[
+            const SizedBox(height: 8),
+            FilledButton.tonal(
+                onPressed: () => _request(k), child: Text(btn)),
+          ],
+        ]),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!checked) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    if (_all || st.isEmpty || skipped || entered) {
+      entered = true;
+      return const Shell();
+    }
+    final t = Theme.of(context);
+    final sdk = st['sdk'];
+    return Scaffold(
+      appBar: AppBar(title: const Text('تجهيز التطبيق')),
+      body: ListView(padding: const EdgeInsets.all(16), children: [
+        Text('محتاجين تفعيل 3 صلاحيات عشان التطبيق يشتغل كامل:',
+            style: t.textTheme.titleMedium),
+        const SizedBox(height: 12),
+        _item(
+            t,
+            'storage',
+            '1) الوصول إلى الملفات',
+            'لقراءة ملف Excel من مجلد A2R_Sender واختيار الصور والاستيكرات.',
+            'السماح بالوصول للملفات'),
+        _item(
+            t,
+            'overlay',
+            '2) العرض فوق التطبيقات',
+            'عشان الفقاعة تقدر تفتح واتساب بيزنس من الخلفية.',
+            'السماح بالعرض فوق التطبيقات'),
+        _item(
+            t,
+            'a11y',
+            '3) خدمة إمكانية الوصول',
+            'تكتب كلمة البحث في واتساب بيزنس فقط. لا تقرأ محادثاتك ولا تضغط إرسال. '
+                'فعّلي "A2R Sender" من الخدمات المثبتة.',
+            'فتح إعدادات إمكانية الوصول'),
+        if (sdk is int && sdk >= 33 && !_ok('a11y'))
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                      'لو خيار التفعيل رمادي (أندرويد 13+): افتحي معلومات التطبيق ← القائمة ⋮ ← "السماح بالإعدادات المقيّدة"، ثم ارجعي وفعّلي الخدمة.'),
+                  TextButton(
+                      onPressed: () => Bubble.open('openAppInfo'),
+                      child: const Text('فتح معلومات التطبيق')),
+                ]),
+          ),
+        const SizedBox(height: 16),
+        OutlinedButton(
+            onPressed: () => setState(() => skipped = true),
+            child: const Text('متابعة بدون تفعيل (بعض الميزات لن تعمل)')),
+      ]),
+    );
+  }
+}
+
 // ======================= الهيكل: تابان =======================
 class Shell extends StatefulWidget {
   const Shell({super.key});
@@ -1060,7 +1223,7 @@ class App extends StatelessWidget {
         outlinedButtonTheme: OutlinedButtonThemeData(
             style: OutlinedButton.styleFrom(minimumSize: big)),
       ),
-      home: const Shell(),
+      home: const Gate(),
     );
   }
 }
@@ -1254,7 +1417,10 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
   Future<void> _browse() async {
     final room = kLimit[kind]! - media.length;
     if (room <= 0) return;
-    await prepareFolder(); // يطلب صلاحية الملفات لو لم تُمنح
+    if (await prepareFolder() != null) {
+      await Perm.reqStorage();
+      return;
+    }
     if (!mounted) return;
     final st = kind == 'stickers';
     final res = await Navigator.push<List<String>>(
@@ -1266,6 +1432,7 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
           fallbackDir: st
               ? _firstDir([
                   '$kRoot/Android/media/com.whatsapp.w4b/WhatsApp Business/Media/WhatsApp Business Stickers',
+                  '$kRoot/WhatsApp Business/Media/WhatsApp Business Stickers',
                   '$kRoot/Download',
                 ])
               : _firstDir(['$kRoot/DCIM/Camera', '$kRoot/Pictures', '$kRoot/Download']),
@@ -1353,7 +1520,19 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
         if (err != null)
           Card(
               color: Theme.of(context).colorScheme.errorContainer,
-              child: Padding(padding: const EdgeInsets.all(12), child: Text(err!)))
+              child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(err!),
+                        if (err!.contains('اسمحي')) ...[
+                          const SizedBox(height: 8),
+                          FilledButton.tonal(
+                              onPressed: () => Perm.reqStorage(),
+                              child: const Text('منح صلاحية الملفات')),
+                        ],
+                      ])))
         else
           Card(
             child: Padding(
@@ -2121,7 +2300,10 @@ class _LabelTabState extends State<LabelTab> with WidgetsBindingObserver {
   Future<void> _browse() async {
     final room = kLimit[kind]! - media.length;
     if (room <= 0) return;
-    await prepareFolder();
+    if (await prepareFolder() != null) {
+      await Perm.reqStorage();
+      return;
+    }
     if (!mounted) return;
     final st = kind == 'stickers';
     final res = await Navigator.push<List<String>>(
@@ -2133,6 +2315,7 @@ class _LabelTabState extends State<LabelTab> with WidgetsBindingObserver {
           fallbackDir: st
               ? _firstDir([
                   '$kRoot/Android/media/com.whatsapp.w4b/WhatsApp Business/Media/WhatsApp Business Stickers',
+                  '$kRoot/WhatsApp Business/Media/WhatsApp Business Stickers',
                   '$kRoot/Download',
                 ])
               : _firstDir(['$kRoot/DCIM/Camera', '$kRoot/Pictures', '$kRoot/Download']),
