@@ -8,6 +8,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter/foundation.dart' show compute;
 import 'package:image_picker/image_picker.dart' show ImagePicker, ImageSource;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -23,6 +24,14 @@ const Map<String, String> kKinds = {
   'image': 'صورة فقط',
   'imageText': 'صورة مع نص',
   'stickers': 'استيكر أو أكثر',
+};
+
+/// أسماء مختصرة لشريط اختيار نوع الرسالة.
+const Map<String, String> kKindsShort = {
+  'text': 'نص فقط',
+  'image': 'صورة',
+  'imageText': 'صورة + نص',
+  'stickers': 'استيكرات',
 };
 // أقصى عدد ملفات في الرسالة (واتساب يقبل حتى 30). الاستيكرات: واحد أو أكثر بدون عدد محدد.
 const Map<String, int> kLimit = {
@@ -200,6 +209,36 @@ G? parseRow(List<String> c) {
     out.add(g);
   }
   return (groups: out, dups: dups, off: off);
+}
+
+/// قراءة وتحليل الشيت كاملاً — تُستدعى عبر compute حتى لا يتجمد خيط الواجهة.
+({List<G> groups, int dups, int off}) parseSheetFile(String path) =>
+    parseSheet(readRows(path));
+
+/// فحص مجلد وسائط (أسماء المجلدات والملفات مرتبة) — يعمل عبر compute خارج خيط الواجهة.
+({List<String> dirs, List<String> files, bool ok}) scanMediaDir(
+    ({String dir, List<String> exts}) q) {
+  try {
+    final d = <String>[];
+    final f = <String>[];
+    for (final e in Directory(q.dir).listSync(followLinks: false)) {
+      final n = p.basename(e.path);
+      if (n.startsWith('.')) continue;
+      if (e is Directory) {
+        d.add(e.path);
+      } else if (e is File &&
+          q.exts.contains(p.extension(n).toLowerCase().replaceFirst('.', ''))) {
+        f.add(e.path);
+      }
+    }
+    d.sort((a, b) =>
+        p.basename(a).toLowerCase().compareTo(p.basename(b).toLowerCase()));
+    f.sort((a, b) =>
+        File(b).lastModifiedSync().compareTo(File(a).lastModifiedSync()));
+    return (dirs: d, files: f, ok: true);
+  } catch (_) {
+    return (dirs: const [], files: const [], ok: false);
+  }
 }
 
 String _xmlUnesc(String s) => s
@@ -979,6 +1018,7 @@ class Bubble {
   }
 
   /// يدمج حالات الفقاعة (تم/تخطي) في المهمة المحفوظة [key] = job أو ujob.
+  /// في وضع المصنف المفتوح القائمة تكبر مع كل محادثة تفتحها الفقاعة، وتُلتقط أسماؤها.
   static Future<({bool active, bool changed})> sync(String key) async {
     final j = Store.data[key];
     if (j is! Map) return (active: false, changed: false);
@@ -987,8 +1027,12 @@ class Bubble {
     var changed = false;
     final st = j['st'];
     final ns = s['st'];
-    if (st is List && ns is List && st.length == ns.length) {
-      for (var i = 0; i < st.length; i++) {
+    if (st is List && ns is List && ns.length >= st.length) {
+      while (st.length < ns.length) {
+        st.add('pending');
+        changed = true;
+      }
+      for (var i = 0; i < ns.length; i++) {
         final n = ns[i];
         final v = _codes[(n is int ? n : 0).clamp(0, 2).toInt()];
         if (st[i] != v) {
@@ -997,6 +1041,23 @@ class Bubble {
         }
       }
       if (changed) await Store.save();
+    }
+    final tt = s['tt'];
+    final items = j['items'];
+    if (tt is List && items is List) {
+      var grew = false;
+      while (items.length < tt.length) {
+        items.add('');
+        grew = true;
+      }
+      for (var i = 0; i < tt.length; i++) {
+        final v = tt[i].toString();
+        if (v.isNotEmpty && items[i] != v) {
+          items[i] = v;
+          grew = true;
+        }
+      }
+      if (grew) await Store.save();
     }
     final active = s['active'] == true;
     if (!active) await clear();
@@ -1038,24 +1099,27 @@ Map<String, dynamic> jobSession(Map<String, dynamic> job,
   };
 }
 
-/// جلسة المصنف: واتساب يُفتح مرة لكل دفعة، وكل ضغطة تكتب اسم الجروب التالي في الدفعة.
-Map<String, dynamic> labelSession(Map<String, dynamic> job,
-    {String mode = 'share'}) {
+/// جلسة المصنف المفتوح: المستخدم يفتح المصنف في واتساب بنفسه، والفقاعة تفتح
+/// محادثات القائمة الظاهرة واحدة واحدة وتلتقط اسم كل محادثة عند فتحها.
+/// الرسائل المصحوبة بوسائط تُرسل من داخل المحادثة عبر المشاركة بالبحث بالاسم الملتقط.
+Map<String, dynamic> labelSession(Map<String, dynamic> job) {
   final names = (job['items'] as List).map((e) => e.toString()).toList();
   final st = job['st'] as List;
-  final bs = ((job['batch'] as int?) ?? 5).clamp(1, 30).toInt();
   return {
     'id': 'ujob',
-    'mode': mode,
+    'mode': 'listwalk',
     'pkg': WaApp.pkg,
     'text': job['text'] as String,
     'media': (job['media'] as List).map((e) => e.toString()).toList(),
-    'items': List.generate(names.length, (i) => {
-          't': names[i],
-          'k': names[i],
-          'l': i % bs == 0,
-          's': Bubble.code(st[i] as String),
-        }),
+    'seen': names,
+    'items': List.generate(
+        names.length,
+        (i) => {
+              't': names[i],
+              'k': names[i],
+              'l': false,
+              's': Bubble.code(i < st.length ? st[i] as String : 'pending'),
+            }),
   };
 }
 
@@ -1098,47 +1162,48 @@ class _BubbleCardState extends State<BubbleCard> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final on = st['a11y'] == true;
     final t = Theme.of(context);
+    if (on) {
+      // الخدمة مفعّلة: زر التشغيل مباشرة بدون كارت وشرح.
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          FilledButton.icon(
+              onPressed: widget.onStart,
+              icon: const Icon(Icons.play_circle_outline),
+              label: Text(widget.startLabel)),
+          if (st['overlay'] != true)
+            TextButton(
+                onPressed: () => Bubble.open('openOverlay'),
+                child: const Text(
+                    'لو الفقاعة لا تفتح واتساب: اسمحي بالعرض فوق التطبيقات')),
+        ],
+      );
+    }
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Row(children: [
-            Icon(Icons.bubble_chart,
-                color: on ? Colors.green : t.colorScheme.outline),
+            Icon(Icons.bubble_chart, color: t.colorScheme.outline),
             const SizedBox(width: 8),
             Expanded(
-                child: Text(
-                    on
-                        ? 'الفقاعة العائمة جاهزة'
-                        : 'الفقاعة العائمة (تفعيل لمرة واحدة)',
+                child: Text('الفقاعة العائمة (تفعيل لمرة واحدة)',
                     style: t.textTheme.titleSmall)),
           ]),
           const SizedBox(height: 8),
-          if (!on) ...[
-            const Text(
-                'تكتب الفقاعة كلمة البحث في واتساب بيزنس بدل اللصق اليدوي، وتنقلك للجروب التالي بدون الرجوع للتطبيق. '
-                'فعّلي \"A2R Sender\" من إعدادات إمكانية الوصول (الخدمات المثبتة). الخدمة مقصورة على واتساب بيزنس '
-                'ولا تضغط على الجروب ولا على إرسال.'),
-            const SizedBox(height: 8),
-            FilledButton.tonalIcon(
-                onPressed: () => Bubble.open('openA11y'),
-                icon: const Icon(Icons.accessibility_new),
-                label: const Text('فتح إعدادات إمكانية الوصول')),
-            TextButton(
-                onPressed: () => Bubble.open('openAppInfo'),
-                child: const Text(
-                    'التفعيل مقفول أو ظهرت رسالة \"إعداد مقيّد\"؟ افتحي معلومات التطبيق')),
-          ] else ...[
-            FilledButton.icon(
-                onPressed: widget.onStart,
-                icon: const Icon(Icons.play_circle_outline),
-                label: Text(widget.startLabel)),
-            if (st['overlay'] != true)
-              TextButton(
-                  onPressed: () => Bubble.open('openOverlay'),
-                  child: const Text(
-                      'لو الفقاعة لا تفتح واتساب: اسمحي بالعرض فوق التطبيقات')),
-          ],
+          const Text(
+              'تكتب الفقاعة كلمة البحث في واتساب بيزنس بدل اللصق اليدوي، وتنقلك للجروب التالي بدون الرجوع للتطبيق. '
+              'فعّلي "A2R Sender" من إعدادات إمكانية الوصول (الخدمات المثبتة). الخدمة مقصورة على واتساب بيزنس '
+              'ولا تضغط على الجروب ولا على إرسال.'),
+          const SizedBox(height: 8),
+          FilledButton.tonalIcon(
+              onPressed: () => Bubble.open('openA11y'),
+              icon: const Icon(Icons.accessibility_new),
+              label: const Text('فتح إعدادات إمكانية الوصول')),
+          TextButton(
+              onPressed: () => Bubble.open('openAppInfo'),
+              child: const Text(
+                  'التفعيل مقفول أو ظهرت رسالة "إعداد مقيّد"؟ افتحي معلومات التطبيق')),
         ]),
       ),
     );
@@ -1174,7 +1239,6 @@ class Gate extends StatefulWidget {
 class _GateState extends State<Gate> with WidgetsBindingObserver {
   Map<String, dynamic> st = {};
   bool checked = false, skipped = false, entered = false, busy = false;
-  final Set<String> asked = {};
 
   @override
   void initState() {
@@ -1207,15 +1271,6 @@ class _GateState extends State<Gate> with WidgetsBindingObserver {
         st = r;
         checked = true;
       });
-      if (r.isEmpty || _all || skipped || entered) return;
-      // يطلب تلقائياً أول صلاحية ناقصة (مرة واحدة لكل صلاحية)، والباقي بالأزرار.
-      for (final k in const ['storage', 'overlay', 'a11y']) {
-        if (!_ok(k) && asked.add(k)) {
-          await Future<void>.delayed(const Duration(milliseconds: 400));
-          if (mounted) await _request(k);
-          break;
-        }
-      }
     } finally {
       busy = false;
     }
@@ -1380,6 +1435,9 @@ class App extends StatelessWidget {
 // ======================= شاشة الرسالة =======================
 class Home extends StatefulWidget {
   const Home({super.key});
+
+  /// للاختبارات فقط: بيانات شيت جاهزة بدل قراءة الملف من الذاكرة.
+  static ({List<G> groups, int dups, int off, String src})? debugSheet;
   @override
   State<Home> createState() => _HomeState();
 }
@@ -1440,7 +1498,9 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
   }
 
   Future<void> _init() async {
-    await Store.load();
+    if (Home.debugSheet == null) {
+      await Store.load();
+    }
     Wa.invalidate();
     final sc = Store.data['cat'];
     if (sc is String) cat = sc;
@@ -1460,6 +1520,19 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
   }
 
   Future<void> _reload() async {
+    final dbg = Home.debugSheet;
+    if (dbg != null) {
+      if (!mounted) return;
+      setState(() {
+        srcPath = dbg.src;
+        groups = dbg.groups;
+        dups = dbg.dups;
+        off = dbg.off;
+        err = null;
+        loading = false;
+      });
+      return;
+    }
     var e = await prepareFolder();
     var g = <G>[];
     var dp = 0, of = 0;
@@ -1467,10 +1540,11 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
     if (e == null) {
       src = findExcel();
       if (src == null) {
-        e = 'لا يوجد ملف جروبات بعد.\nاضغطي "استيراد ملف Excel"، أو ضعي ملف .xlsx داخل مجلد A2R_Sender في الذاكرة الداخلية.';
+        e = 'لا يوجد ملف جروبات بعد.\nاضغطي "استيراد ملف Excel" من قائمة ⋮، أو ضعي ملف .xlsx داخل مجلد A2R_Sender في الذاكرة الداخلية.';
       } else {
         try {
-          final r = parseSheet(readRows(src));
+          // القراءة والتحليل في الخلفية حتى لا تتجمد الواجهة مع الشيتات الكبيرة.
+          final r = await compute(parseSheetFile, src);
           g = r.groups;
           dp = r.dups;
           of = r.off;
@@ -1603,6 +1677,35 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
     await _addMedia(res);
   }
 
+  /// زر إضافة واحد يفتح اختيار المصدر: معرض الصور أو التصفح من مجلد.
+  Future<void> _addChooser() async {
+    final src = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(
+            leading: const Icon(Icons.photo_library),
+            title: const Text('من معرض الصور'),
+            onTap: () => Navigator.pop(ctx, 'gallery'),
+          ),
+          ListTile(
+            leading: const Icon(Icons.folder_open),
+            title: const Text('من مجلد في الهاتف — آخر مجلد محفوظ'),
+            onTap: () => Navigator.pop(ctx, 'browse'),
+          ),
+          const SizedBox(height: 8),
+        ]),
+      ),
+    );
+    if (!mounted) return;
+    if (src == 'gallery') {
+      await _gallery();
+    } else if (src == 'browse') {
+      await _browse();
+    }
+  }
+
   String? _validate() {
     if (kind == 'text' && text.text.trim().isEmpty) return 'اكتبي نص الرسالة';
     if (kind != 'text' && media.isEmpty) {
@@ -1649,41 +1752,79 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final job = Store.job;
     final lim = kLimit[kind]!;
+    final t = Theme.of(context);
     return Scaffold(
-      appBar: AppBar(title: Text('A2R Sender • ${WaApp.label}'), actions: [
-        IconButton(
-            tooltip: 'إعدادات التطبيق',
-            onPressed: () => showAppSettings(context, () {
-                  if (mounted) setState(() {});
-                }),
-            icon: const Icon(Icons.settings)),
-        IconButton(
-            tooltip: 'أسماء الجروبات من واتساب',
-            onPressed: () => Navigator.push(
-                context,
-                MaterialPageRoute(
-                    builder: (_) => WaGroupsScreen(groups: groups))),
-            icon: const Icon(Icons.groups)),
-        IconButton(
-            tooltip: 'استيراد ملف Excel',
-            onPressed: _importExcel,
-            icon: const Icon(Icons.upload_file)),
-        IconButton(
-            tooltip: 'تحديث من ملف Excel',
-            onPressed: _reload,
-            icon: const Icon(Icons.refresh)),
-      ]),
+      appBar: AppBar(
+          title: Row(children: [
+            const Text('A2R Sender'),
+            const SizedBox(width: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+              decoration: BoxDecoration(
+                color: t.colorScheme.primary,
+                borderRadius: BorderRadius.circular(999),
+              ),
+              child: Text(WaApp.label,
+                  style:
+                      TextStyle(color: t.colorScheme.onPrimary, fontSize: 11.5)),
+            ),
+          ]),
+          actions: [
+            PopupMenuButton<String>(
+              tooltip: 'أدوات التطبيق',
+              onSelected: (v) {
+                if (v == 'import') {
+                  _importExcel();
+                } else if (v == 'groups') {
+                  Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                          builder: (_) => WaGroupsScreen(groups: groups)));
+                } else if (v == 'refresh') {
+                  _reload();
+                } else if (v == 'settings') {
+                  showAppSettings(context, () {
+                    if (mounted) setState(() {});
+                  });
+                }
+              },
+              itemBuilder: (_) => const [
+                PopupMenuItem(
+                    value: 'import',
+                    child: ListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(Icons.upload_file),
+                        title: Text('استيراد ملف Excel'))),
+                PopupMenuItem(
+                    value: 'groups',
+                    child: ListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(Icons.groups),
+                        title: Text('أسماء الجروبات من واتساب'))),
+                PopupMenuItem(
+                    value: 'refresh',
+                    child: ListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(Icons.refresh),
+                        title: Text('تحديث من ملف Excel'))),
+                PopupMenuItem(
+                    value: 'settings',
+                    child: ListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(Icons.settings),
+                        title: Text('إعدادات التطبيق'))),
+              ],
+            ),
+          ]),
       body: ListView(padding: const EdgeInsets.all(16), children: [
         if (loading) const LinearProgressIndicator(),
-        OutlinedButton.icon(
-          onPressed: _importExcel,
-          icon: const Icon(Icons.upload_file),
-          label: const Text('استيراد ملف Excel'),
-        ),
-        const SizedBox(height: 8),
         if (err != null)
           Card(
-              color: Theme.of(context).colorScheme.errorContainer,
+              color: t.colorScheme.errorContainer,
               child: Padding(
                   padding: const EdgeInsets.all(12),
                   child: Column(
@@ -1701,82 +1842,111 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
           Card(
             child: Padding(
               padding: const EdgeInsets.all(12),
-              child: Text('${groups.length} جروب جاهز'
-                  '${dups > 0 ? ' • مكرر تم تجاهله: $dups' : ''}'
-                  '${off > 0 ? ' • موقوف: $off' : ''}\n'
-                  'الملف: ${srcPath ?? kFile}'
-                  '${_cat != null ? '\nالمحدد للإرسال: ${shown.length} جروب' : ''}'),
-            ),
-          ),
-        if (err == null && _cats.isNotEmpty) ...[
-          const SizedBox(height: 8),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(12),
               child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('الإرسال إلى:',
-                        style: Theme.of(context).textTheme.titleSmall),
-                    const SizedBox(height: 8),
-                    Wrap(spacing: 8, runSpacing: 8, children: [
-                      ChoiceChip(
-                          label: Text('الكل (${groups.length})'),
-                          selected: _cat == null,
-                          onSelected: (_) => _setCat(null)),
-                      for (final c in _cats)
-                        ChoiceChip(
-                            label: Text(
-                                '$c (${groups.where((g) => inCat(g, c)).length})'),
-                            selected: _cat != null &&
-                                _cat != kNoCat &&
-                                _nz(_cat!) == _nz(c),
-                            onSelected: (_) => _setCat(c)),
-                      if (groups.any((g) => g.cats.isEmpty && !Wa.inAnyWaCat(g)))
-                        ChoiceChip(
-                            label: Text(
-                                'بدون تصنيف (${groups.where((g) => inCat(g, kNoCat)).length})'),
-                            selected: _cat == kNoCat,
-                            onSelected: (_) => _setCat(kNoCat)),
+                    Row(children: [
+                      Expanded(
+                        child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text('${groups.length} جروب جاهز',
+                                  style: t.textTheme.titleMedium?.copyWith(
+                                      fontWeight: FontWeight.bold)),
+                              Text(
+                                '${p.basename(srcPath ?? kFile)}'
+                                '${dups > 0 ? ' • مكرر تم تجاهله: $dups' : ''}'
+                                '${off > 0 ? ' • موقوف: $off' : ''}',
+                                style: t.textTheme.bodySmall,
+                              ),
+                            ]),
+                      ),
+                      IconButton(
+                          tooltip: 'تحديث من ملف Excel',
+                          onPressed: _reload,
+                          icon: const Icon(Icons.refresh)),
                     ]),
+                    if (srcPath != null && srcPath != kFile) ...[
+                      const SizedBox(height: 6),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFFDF3E3),
+                          borderRadius: BorderRadius.circular(10),
+                          border:
+                              Border.all(color: const Color(0xFFF0DCB5)),
+                        ),
+                        child: Text(
+                          'المصدر: ${p.basename(srcPath!)} — التطبيق يستخدم أحدث ملف Excel في المجلد تلقائياً. '
+                          'لو هذا ليس الملف الصحيح احذفيه من المجلد أو استورديه من قائمة ⋮.',
+                          style: const TextStyle(
+                              fontSize: 12, color: Color(0xFF7A5A1E)),
+                        ),
+                      ),
+                    ],
+                    if (_cats.isNotEmpty) ...[
+                      const SizedBox(height: 10),
+                      Text('الإرسال إلى:', style: t.textTheme.titleSmall),
+                      const SizedBox(height: 8),
+                      Wrap(spacing: 8, runSpacing: 8, children: [
+                        ChoiceChip(
+                            label: Text('الكل (${groups.length})'),
+                            selected: _cat == null,
+                            onSelected: (_) => _setCat(null)),
+                        for (final c in _cats)
+                          ChoiceChip(
+                              label: Text(
+                                  '$c (${groups.where((g) => inCat(g, c)).length})'),
+                              selected: _cat != null &&
+                                  _cat != kNoCat &&
+                                  _nz(_cat!) == _nz(c),
+                              onSelected: (_) => _setCat(c)),
+                        if (groups
+                            .any((g) => g.cats.isEmpty && !Wa.inAnyWaCat(g)))
+                          ChoiceChip(
+                              label: Text(
+                                  'بدون تصنيف (${groups.where((g) => inCat(g, kNoCat)).length})'),
+                              selected: _cat == kNoCat,
+                              onSelected: (_) => _setCat(kNoCat)),
+                      ]),
+                    ],
+                    if (_cat != null) ...[
+                      const SizedBox(height: 6),
+                      Text('المحدد للإرسال: ${shown.length} جروب',
+                          style: t.textTheme.bodySmall),
+                    ],
                   ]),
             ),
           ),
-        ],
         if (job != null) ...[
           const SizedBox(height: 8),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Column(children: [
-                Text(
-                    'مهمة غير منتهية: ${(job['st'] as List).where((s) => s != 'pending').length} من ${(job['st'] as List).length}'),
-                const SizedBox(height: 8),
-                FilledButton(
-                    onPressed: () async {
-                      await Navigator.push(context,
-                          MaterialPageRoute(builder: (_) => const SendScreen()));
-                      if (mounted) setState(() {});
-                    },
-                    child: const Text('استكمال الإرسال')),
-              ]),
-            ),
+          FilledButton.tonalIcon(
+            onPressed: () async {
+              await Navigator.push(context,
+                  MaterialPageRoute(builder: (_) => const SendScreen()));
+              if (mounted) setState(() {});
+            },
+            icon: const Icon(Icons.play_arrow),
+            label: Text(
+                'استكمال المهمة غير المنتهية (${(job['st'] as List).where((s) => s != 'pending').length} من ${(job['st'] as List).length})'),
           ),
         ],
-        const SizedBox(height: 8),
-        for (final k in kKinds.keys)
-          ListTile(
-            selected: kind == k,
-            leading: Icon(kind == k
-                ? Icons.radio_button_checked
-                : Icons.radio_button_off),
-            title: Text(kKinds[k]!,
-                style: Theme.of(context).textTheme.titleMedium),
-            onTap: () => _setKind(k),
-          ),
-        const Divider(),
+        const SizedBox(height: 12),
+        SegmentedButton<String>(
+          segments: [
+            for (final k in kKinds.keys)
+              ButtonSegment(
+                  value: k,
+                  label:
+                      Text(kKindsShort[k]!, overflow: TextOverflow.ellipsis)),
+          ],
+          selected: {kind},
+          showSelectedIcon: false,
+          onSelectionChanged: (v) => _setKind(v.first),
+        ),
         if (kind == 'text' || kind == 'imageText') ...[
-          const SizedBox(height: 8),
+          const SizedBox(height: 12),
           TextField(
             controller: text,
             minLines: 4,
@@ -1787,61 +1957,66 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
           ),
         ],
         if (lim > 0) ...[
-          const SizedBox(height: 16),
-          Wrap(spacing: 12, runSpacing: 12, children: [
-            for (var i = 0; i < media.length; i++)
-              Stack(children: [
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(12),
-                  child: Container(
-                    width: 120,
-                    height: 120,
-                    color: Colors.black12,
-                    child: Image.file(File(media[i]),
-                        width: 120,
-                        height: 120,
-                        fit: kind == 'stickers' ? BoxFit.contain : BoxFit.cover,
-                        cacheWidth: 300,
-                        errorBuilder: (_, __, ___) => const Center(
-                            child: Icon(Icons.broken_image))),
-                  ),
-                ),
-                PositionedDirectional(
-                  top: 0,
-                  end: 0,
-                  child: IconButton.filled(
-                    iconSize: 18,
-                    onPressed: () {
-                      setState(() => media.removeAt(i));
-                      _saveDraft();
-                    },
-                    icon: const Icon(Icons.close),
-                  ),
-                ),
-              ]),
-          ]),
           const SizedBox(height: 12),
-          if (media.length < lim) ...[
-            if (kind != 'stickers') ...[
-              OutlinedButton.icon(
-                onPressed: _gallery,
-                icon: const Icon(Icons.photo_library),
-                label: const Text('اختيار من معرض الصور'),
-              ),
-              const SizedBox(height: 8),
-            ],
-            OutlinedButton.icon(
-              onPressed: _browse,
-              icon: Icon(kind == 'stickers'
-                  ? Icons.emoji_emotions
-                  : Icons.folder_open),
-              label: Text(kind == 'stickers'
-                  ? 'إضافة استيكرات (${media.length}) — آخر مجلد محفوظ'
-                  : 'اختيار من مجلد — آخر مجلد محفوظ'),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (media.isNotEmpty) ...[
+                      Wrap(spacing: 12, runSpacing: 12, children: [
+                        for (var i = 0; i < media.length; i++)
+                          Stack(children: [
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(12),
+                              child: Container(
+                                width: 120,
+                                height: 120,
+                                color: Colors.black12,
+                                child: Image.file(File(media[i]),
+                                    width: 120,
+                                    height: 120,
+                                    fit: kind == 'stickers'
+                                        ? BoxFit.contain
+                                        : BoxFit.cover,
+                                    cacheWidth: 300,
+                                    errorBuilder: (_, __, ___) => const Center(
+                                        child: Icon(Icons.broken_image))),
+                              ),
+                            ),
+                            PositionedDirectional(
+                              top: 0,
+                              end: 0,
+                              child: IconButton.filled(
+                                iconSize: 18,
+                                onPressed: () {
+                                  setState(() => media.removeAt(i));
+                                  _saveDraft();
+                                },
+                                icon: const Icon(Icons.close),
+                              ),
+                            ),
+                          ]),
+                      ]),
+                      const SizedBox(height: 10),
+                    ],
+                    if (media.length < lim)
+                      OutlinedButton.icon(
+                        onPressed: _addChooser,
+                        icon: const Icon(Icons.add),
+                        label: Text(kind == 'stickers'
+                            ? 'إضافة استيكرات (${media.length})'
+                            : 'إضافة صورة'),
+                      )
+                    else
+                      Text('وصلتي للحد الأقصى (${media.length})',
+                          style: t.textTheme.bodySmall),
+                  ]),
             ),
-          ],
+          ),
         ],
-        const SizedBox(height: 24),
+        const SizedBox(height: 16),
         FilledButton.icon(
             onPressed: loading ? null : _start,
             icon: const Icon(Icons.play_arrow),
@@ -2041,12 +2216,25 @@ class _SendScreenState extends State<SendScreen> with WidgetsBindingObserver {
             icon: const Icon(Icons.stop_circle_outlined)),
       ]),
       body: ListView(padding: const EdgeInsets.all(16), children: [
-        LinearProgressIndicator(
-            value: total == 0 ? 0 : (done + skipped) / total, minHeight: 8),
-        const SizedBox(height: 8),
-        Text(
-            'تم $done  •  تخطي $skipped  •  متبقي ${_count('pending')}  (من $total)'),
-        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(children: [
+              LinearProgressIndicator(
+                  value: total == 0 ? 0 : (done + skipped) / total,
+                  minHeight: 8),
+              const SizedBox(height: 8),
+              Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text('تم $done', style: t.textTheme.bodySmall),
+                    Text('تخطي $skipped', style: t.textTheme.bodySmall),
+                    Text('متبقي ${_count('pending')} من $total',
+                        style: t.textTheme.bodySmall),
+                  ]),
+            ]),
+          ),
+        ),
         if (i == null) ...[
           const SizedBox(height: 24),
           const Icon(Icons.check_circle, size: 72, color: Colors.green),
@@ -2062,34 +2250,52 @@ class _SendScreenState extends State<SendScreen> with WidgetsBindingObserver {
           const SizedBox(height: 24),
           FilledButton(onPressed: _finish, child: const Text('إنهاء المهمة')),
         ] else ...[
+          const SizedBox(height: 8),
           Card(
             child: Padding(
               padding: const EdgeInsets.all(16),
               child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('الجروب الحالي', style: t.textTheme.labelMedium),
+                    Text('الجروب الحالي (${i + 1})',
+                        style: t.textTheme.labelMedium),
                     const SizedBox(height: 4),
                     Text(_g(i).name, style: t.textTheme.headlineSmall),
-                    if (_g(i).numbers.isNotEmpty)
-                      Text(_g(i).numbers, style: t.textTheme.titleMedium),
-                    if (_g(i).teacher.isNotEmpty)
-                      Text('المعلمة/المعلم: ${_g(i).teacher}'),
-                    const Divider(height: 24),
-                    Row(children: [
-                      Expanded(
-                          child: Text('ابحثي في واتساب عن:  ${waKey(_g(i))}',
-                              style: t.textTheme.titleMedium)),
-                      IconButton(
-                        tooltip: 'نسخ',
-                        icon: const Icon(Icons.copy),
-                        onPressed: () async {
-                          await Clipboard.setData(
-                              ClipboardData(text: waKey(_g(i))));
-                          if (context.mounted) snack(context, 'تم النسخ');
-                        },
+                    if (_g(i).numbers.isNotEmpty || _g(i).teacher.isNotEmpty)
+                      Text(
+                        [
+                          _g(i).numbers,
+                          if (_g(i).teacher.isNotEmpty)
+                            'المعلمة/المعلم: ${_g(i).teacher}',
+                        ].where((e) => e.isNotEmpty).join(' • '),
+                        style: t.textTheme.bodySmall,
                       ),
-                    ]),
+                    const SizedBox(height: 10),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: t.colorScheme.surfaceContainerHighest
+                            .withOpacity(0.4),
+                        borderRadius: BorderRadius.circular(10),
+                        border:
+                            Border.all(color: t.colorScheme.outlineVariant),
+                      ),
+                      child: Row(children: [
+                        Expanded(
+                            child: Text('كلمة البحث: ${waKey(_g(i))}',
+                                style: t.textTheme.titleSmall)),
+                        IconButton(
+                          tooltip: 'نسخ',
+                          icon: const Icon(Icons.copy),
+                          onPressed: () async {
+                            await Clipboard.setData(
+                                ClipboardData(text: waKey(_g(i))));
+                            if (context.mounted) snack(context, 'تم النسخ');
+                          },
+                        ),
+                      ]),
+                    ),
                   ]),
             ),
           ),
@@ -2102,55 +2308,21 @@ class _SendScreenState extends State<SendScreen> with WidgetsBindingObserver {
                   Padding(
                     padding: const EdgeInsetsDirectional.only(end: 8),
                     child: Image.file(File(m),
-                        width: 48,
-                        height: 48,
+                        width: 40,
+                        height: 40,
                         cacheWidth: 100,
                         errorBuilder: (_, __, ___) =>
                             const Icon(Icons.broken_image)),
                   ),
                 Expanded(
                     child: Text(
-                        body.isEmpty ? kindName(kind) : '${kindName(kind)}: $body',
-                        maxLines: 3,
-                        overflow: TextOverflow.ellipsis)),
+                        body.isEmpty
+                            ? kindName(kind)
+                            : '${kindName(kind)}: $body',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: t.textTheme.bodySmall)),
               ]),
-            ),
-          ),
-          const SizedBox(height: 8),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('طريقة البحث في واتساب:',
-                      style: t.textTheme.titleSmall),
-                  const SizedBox(height: 8),
-                  SegmentedButton<String>(
-                    segments: const [
-                      ButtonSegment(
-                        value: 'review',
-                        label: Text('بحث في الرئيسية (مراجعة)'),
-                        icon: Icon(Icons.search),
-                      ),
-                      ButtonSegment(
-                        value: 'share',
-                        label: Text('مشاركة مباشرة'),
-                        icon: Icon(Icons.share),
-                      ),
-                    ],
-                    selected: {sendMode},
-                    onSelectionChanged: (v) => _setSendMode(v.first),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    sendMode == 'review'
-                        ? 'يبحث برقم الجروب في القائمة الرئيسية لتتأكد من بيانات الجروب ووصفه، ثم تضغط "تجهيز" من الشريط العائم فتظهر الرسالة جاهزة على الإرسال.'
-                        : 'يفتح شاشة المشاركة بالرسالة مباشرة ويبحث برقم الجروب للإرسال السريع.',
-                    style: t.textTheme.bodySmall,
-                  ),
-                ],
-              ),
             ),
           ),
           const SizedBox(height: 8),
@@ -2158,19 +2330,6 @@ class _SendScreenState extends State<SendScreen> with WidgetsBindingObserver {
               startLabel: 'تشغيل الفقاعة من هذا الجروب',
               onStart: () => _startBubble(i)),
           const SizedBox(height: 8),
-          OutlinedButton.icon(
-              onPressed: () => _open(i),
-              icon: const Icon(Icons.chat),
-              label: Text('فتح ${WaApp.label} (يدوي)')),
-          if (opened)
-            Padding(
-              padding: const EdgeInsets.only(top: 12),
-              child: Text(
-                  'اختاري الجروب في واتساب (تم نسخ كلمة البحث) وأرسلي، ثم ارجعي هنا واضغطي "تم الإرسال".',
-                  style: t.textTheme.bodyMedium
-                      ?.copyWith(color: t.colorScheme.primary)),
-            ),
-          const SizedBox(height: 12),
           Row(children: [
             Expanded(
                 child: FilledButton.tonalIcon(
@@ -2184,6 +2343,60 @@ class _SendScreenState extends State<SendScreen> with WidgetsBindingObserver {
                     icon: const Icon(Icons.skip_next),
                     label: const Text('تخطي'))),
           ]),
+          const SizedBox(height: 8),
+          Card(
+            child: ExpansionTile(
+              title: const Text('خيارات إضافية'),
+              subtitle: const Text('طريقة البحث والفتح اليدوي'),
+              childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+              children: [
+                Align(
+                    alignment: AlignmentDirectional.centerStart,
+                    child: Text('طريقة البحث في واتساب:',
+                        style: t.textTheme.titleSmall)),
+                const SizedBox(height: 8),
+                SegmentedButton<String>(
+                  segments: const [
+                    ButtonSegment(
+                      value: 'review',
+                      label: Text('بحث في الرئيسية (مراجعة)'),
+                      icon: Icon(Icons.search),
+                    ),
+                    ButtonSegment(
+                      value: 'share',
+                      label: Text('مشاركة مباشرة'),
+                      icon: Icon(Icons.share),
+                    ),
+                  ],
+                  selected: {sendMode},
+                  onSelectionChanged: (v) => _setSendMode(v.first),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  sendMode == 'review'
+                      ? 'يبحث برقم الجروب في القائمة الرئيسية لتتأكد من بيانات الجروب ووصفه، ثم تضغط "تجهيز" من الشريط العائم فتظهر الرسالة جاهزة على الإرسال.'
+                      : 'يفتح شاشة المشاركة بالرسالة مباشرة ويبحث برقم الجروب للإرسال السريع.',
+                  style: t.textTheme.bodySmall,
+                ),
+                const Divider(height: 24),
+                Align(
+                  alignment: AlignmentDirectional.centerStart,
+                  child: OutlinedButton.icon(
+                      onPressed: () => _open(i),
+                      icon: const Icon(Icons.chat),
+                      label: Text('فتح ${WaApp.label} (يدوي)')),
+                ),
+                if (opened)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 12),
+                    child: Text(
+                        'اختاري الجروب في واتساب (تم نسخ كلمة البحث) وأرسلي، ثم ارجعي هنا واضغطي "تم الإرسال".',
+                        style: t.textTheme.bodyMedium
+                            ?.copyWith(color: t.colorScheme.primary)),
+                  ),
+              ],
+            ),
+          ),
         ],
       ]),
     );
@@ -2210,10 +2423,11 @@ class MediaBrowser extends StatefulWidget {
 
 class _MediaBrowserState extends State<MediaBrowser> {
   late String dir;
-  List<Directory> dirs = [];
-  List<File> files = [];
+  List<String> dirs = [];
+  List<String> files = [];
   final List<String> sel = [];
   String? error;
+  bool scanning = true;
 
   bool get atRoot => dir == kRoot || dir == '/' || p.dirname(dir) == dir;
 
@@ -2227,44 +2441,31 @@ class _MediaBrowserState extends State<MediaBrowser> {
     _scan();
   }
 
+  /// فحص المجلد في الخلفية (compute) حتى لا تتجمد الواجهة في المجلدات الكبيرة.
   void _scan() {
-    try {
-      final d = <Directory>[];
-      final f = <File>[];
-      for (final e in Directory(dir).listSync(followLinks: false)) {
-        final n = p.basename(e.path);
-        if (n.startsWith('.')) continue;
-        if (e is Directory) {
-          d.add(e);
-        } else if (e is File &&
-            widget.exts
-                .contains(p.extension(n).toLowerCase().replaceFirst('.', ''))) {
-          f.add(e);
-        }
-      }
-      d.sort((a, b) => p
-          .basename(a.path)
-          .toLowerCase()
-          .compareTo(p.basename(b.path).toLowerCase()));
-      f.sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
-      dirs = d;
-      files = f;
-      error = null;
-      Store.data[widget.storeKey] = dir; // آخر مسار
-      Store.save();
-    } catch (_) {
-      dirs = [];
-      files = [];
-      error =
-          'لا أستطيع فتح هذا المجلد. اسمحي للتطبيق بالوصول إلى الملفات من إعدادات الهاتف.';
-    }
+    final target = dir;
+    scanning = true;
+    error = null;
+    Store.data[widget.storeKey] = target; // آخر مسار
+    Store.save();
+    compute(scanMediaDir, (dir: target, exts: widget.exts)).then((r) {
+      if (!mounted || dir != target) return;
+      setState(() {
+        dirs = r.dirs;
+        files = r.files;
+        error = r.ok
+            ? null
+            : 'لا أستطيع فتح هذا المجلد. اسمحي للتطبيق بالوصول إلى الملفات من إعدادات الهاتف.';
+        scanning = false;
+      });
+    });
   }
 
   void _go(String d) {
     setState(() {
       dir = d;
-      _scan();
     });
+    _scan();
   }
 
   void _toggle(String path) {
@@ -2364,90 +2565,96 @@ class _MediaBrowserState extends State<MediaBrowser> {
           ),
           const Divider(height: 1),
           Expanded(
-            child: error != null
-                ? Center(
-                    child: Padding(
-                        padding: const EdgeInsets.all(16), child: Text(error!)))
-                : CustomScrollView(slivers: [
-                    SliverList(
-                      delegate: SliverChildBuilderDelegate(
-                        (c, i) => ListTile(
-                          dense: true,
-                          leading: const Icon(Icons.folder),
-                          title: Text(p.basename(dirs[i].path)),
-                          onTap: () => _go(dirs[i].path),
-                        ),
-                        childCount: dirs.length,
-                      ),
-                    ),
-                    if (files.isEmpty)
-                      const SliverToBoxAdapter(
+            child: scanning
+                ? const Center(child: CircularProgressIndicator())
+                : error != null
+                    ? Center(
                         child: Padding(
-                          padding: EdgeInsets.all(16),
-                          child: Text('لا توجد ملفات مناسبة في هذا المجلد'),
+                            padding: const EdgeInsets.all(16),
+                            child: Text(error!)))
+                    : CustomScrollView(slivers: [
+                        SliverList(
+                          delegate: SliverChildBuilderDelegate(
+                            (c, i) => ListTile(
+                              dense: true,
+                              leading: const Icon(Icons.folder),
+                              title: Text(p.basename(dirs[i])),
+                              onTap: () => _go(dirs[i]),
+                            ),
+                            childCount: dirs.length,
+                          ),
                         ),
-                      ),
-                    SliverPadding(
-                      padding: const EdgeInsets.all(8),
-                      sliver: SliverGrid(
-                        gridDelegate:
-                            const SliverGridDelegateWithFixedCrossAxisCount(
-                                crossAxisCount: 3,
-                                mainAxisSpacing: 8,
-                                crossAxisSpacing: 8),
-                        delegate: SliverChildBuilderDelegate(
-                          (c, i) {
-                            final f = files[i];
-                            final selIdx = sel.indexOf(f.path);
-                            final on = selIdx >= 0;
-                            return GestureDetector(
-                              onTap: () => _toggle(f.path),
-                              child: Container(
-                                decoration: BoxDecoration(
-                                  borderRadius: BorderRadius.circular(10),
-                                  border: on
-                                      ? Border.all(color: cs.primary, width: 3)
-                                      : null,
-                                ),
-                                child: ClipRRect(
-                                  borderRadius: BorderRadius.circular(8),
-                                  child: Stack(fit: StackFit.expand, children: [
-                                    Container(
-                                      color: Colors.black12,
-                                      child: Image.file(f,
-                                          fit: BoxFit.contain,
-                                          cacheWidth: 300,
-                                          errorBuilder: (_, __, ___) =>
-                                              const Center(
-                                                  child: Icon(
-                                                      Icons.broken_image))),
+                        if (files.isEmpty)
+                          const SliverToBoxAdapter(
+                            child: Padding(
+                              padding: EdgeInsets.all(16),
+                              child: Text('لا توجد ملفات مناسبة في هذا المجلد'),
+                            ),
+                          ),
+                        SliverPadding(
+                          padding: const EdgeInsets.all(8),
+                          sliver: SliverGrid(
+                            gridDelegate:
+                                const SliverGridDelegateWithFixedCrossAxisCount(
+                                    crossAxisCount: 3,
+                                    mainAxisSpacing: 8,
+                                    crossAxisSpacing: 8),
+                            delegate: SliverChildBuilderDelegate(
+                              (c, i) {
+                                final path = files[i];
+                                final selIdx = sel.indexOf(path);
+                                final on = selIdx >= 0;
+                                return GestureDetector(
+                                  onTap: () => _toggle(path),
+                                  child: Container(
+                                    decoration: BoxDecoration(
+                                      borderRadius: BorderRadius.circular(10),
+                                      border: on
+                                          ? Border.all(
+                                              color: cs.primary, width: 3)
+                                          : null,
                                     ),
-                                    if (on)
-                                      Container(
-                                        color: Colors.black38,
-                                        child: Center(
-                                          child: CircleAvatar(
-                                            radius: 18,
-                                            backgroundColor: cs.primary,
-                                            child: Text(
-                                              '${selIdx + 1}',
-                                              style: TextStyle(
-                                                  color: cs.onPrimary,
-                                                  fontWeight: FontWeight.bold),
+                                    child: ClipRRect(
+                                      borderRadius: BorderRadius.circular(8),
+                                      child:
+                                          Stack(fit: StackFit.expand, children: [
+                                        Container(
+                                          color: Colors.black12,
+                                          child: Image.file(File(path),
+                                              fit: BoxFit.contain,
+                                              cacheWidth: 300,
+                                              errorBuilder: (_, __, ___) =>
+                                                  const Center(
+                                                      child: Icon(
+                                                          Icons.broken_image))),
+                                        ),
+                                        if (on)
+                                          Container(
+                                            color: Colors.black38,
+                                            child: Center(
+                                              child: CircleAvatar(
+                                                radius: 18,
+                                                backgroundColor: cs.primary,
+                                                child: Text(
+                                                  '${selIdx + 1}',
+                                                  style: TextStyle(
+                                                      color: cs.onPrimary,
+                                                      fontWeight:
+                                                          FontWeight.bold),
+                                                ),
+                                              ),
                                             ),
                                           ),
-                                        ),
-                                      ),
-                                  ]),
-                                ),
-                              ),
-                            );
-                          },
-                          childCount: files.length,
+                                      ]),
+                                    ),
+                                  ),
+                                );
+                              },
+                              childCount: files.length,
+                            ),
+                          ),
                         ),
-                      ),
-                    ),
-                  ]),
+                      ]),
           ),
         ]),
         bottomNavigationBar: SafeArea(
@@ -2470,6 +2677,9 @@ class _MediaBrowserState extends State<MediaBrowser> {
 // ======================= تاب: رسالة موحدة لمصنف واتساب =======================
 class LabelTab extends StatefulWidget {
   const LabelTab({super.key});
+
+  /// للاختبارات فقط: تخطي انتظار التحميل من الذاكرة.
+  static bool debugSkipLoad = false;
   @override
   State<LabelTab> createState() => _LabelTabState();
 }
@@ -2478,9 +2688,6 @@ class _LabelTabState extends State<LabelTab> with WidgetsBindingObserver {
   final TextEditingController text = TextEditingController();
   String kind = 'text';
   List<String> media = [];
-  String? label;
-  final Set<String> off = {};
-  int batch = 5;
   bool ready = false;
 
   @override
@@ -2507,7 +2714,9 @@ class _LabelTabState extends State<LabelTab> with WidgetsBindingObserver {
   }
 
   Future<void> _init() async {
-    await Store.load();
+    if (!LabelTab.debugSkipLoad) {
+      await Store.load();
+    }
     Wa.invalidate();
     final d = Store.data['draft2'];
     if (d is Map<String, dynamic>) {
@@ -2518,42 +2727,15 @@ class _LabelTabState extends State<LabelTab> with WidgetsBindingObserver {
           .map((e) => e.toString())
           .where((x) => File(x).existsSync())
           .toList();
-      label = d['label'] as String?;
-      batch = ((d['batch'] as int?) ?? 5).clamp(1, 30).toInt();
-      off
-        ..clear()
-        ..addAll(((d['off'] as List?) ?? const []).map((e) => e.toString()));
     }
     if (!mounted) return;
     setState(() => ready = true);
   }
 
   void _save() {
-    Store.data['draft2'] = {
-      'kind': kind,
-      'text': text.text,
-      'media': media,
-      'label': label,
-      'batch': batch,
-      'off': off.toList(),
-    };
+    Store.data['draft2'] = {'kind': kind, 'text': text.text, 'media': media};
     Store.save();
   }
-
-  /// المصنف المحدد لو ما زال موجوداً في المصنفات المحفوظة.
-  String? get _label {
-    final l = label;
-    if (l == null) return null;
-    return Wa.cats.containsKey(l) ? l : null;
-  }
-
-  List<String> get _names {
-    final l = _label;
-    if (l == null) return [];
-    return Wa.cats[l] ?? [];
-  }
-
-  List<String> get _chosen => _names.where((n) => !off.contains(n)).toList();
 
   void _setKind(String k) {
     setState(() {
@@ -2631,6 +2813,35 @@ class _LabelTabState extends State<LabelTab> with WidgetsBindingObserver {
     await _addMedia(res);
   }
 
+  /// زر إضافة واحد يفتح اختيار المصدر: معرض الصور أو التصفح من مجلد.
+  Future<void> _addChooser() async {
+    final src = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(
+            leading: const Icon(Icons.photo_library),
+            title: const Text('من معرض الصور'),
+            onTap: () => Navigator.pop(ctx, 'gallery'),
+          ),
+          ListTile(
+            leading: const Icon(Icons.folder_open),
+            title: const Text('من مجلد في الهاتف — آخر مجلد محفوظ'),
+            onTap: () => Navigator.pop(ctx, 'browse'),
+          ),
+          const SizedBox(height: 8),
+        ]),
+      ),
+    );
+    if (!mounted) return;
+    if (src == 'gallery') {
+      await _gallery();
+    } else if (src == 'browse') {
+      await _browse();
+    }
+  }
+
   String? _validate() {
     if (kind == 'text' && text.text.trim().isEmpty) return 'اكتبي نص الرسالة';
     if (kind != 'text' && media.isEmpty) {
@@ -2639,40 +2850,31 @@ class _LabelTabState extends State<LabelTab> with WidgetsBindingObserver {
     return null;
   }
 
+  /// يجهز مهمة "المصنف المفتوح": هو يفتح المصنف في واتساب بنفسه،
+  /// والفقاعة تفتح محادثات القائمة الظاهرة واحدة واحدة وتجهز الرسالة.
   Future<void> _start() async {
     final v = _validate();
     if (v != null) {
       snack(context, v);
       return;
     }
-    final lab = _label;
-    if (lab == null) {
-      snack(context, 'اختاري المصنف أولاً');
-      return;
-    }
-    final sel = _chosen;
-    if (sel.isEmpty) {
-      snack(context, 'لا توجد جروبات محددة في هذا المصنف');
-      return;
-    }
-    final batches = (sel.length / batch).ceil();
     final old = Store.ujob != null;
     final ok = await ask(
         context,
         'تجهيز الإرسال',
-        '${kindName(kind)}${kind == 'stickers' ? ' (${media.length})' : ''} إلى ${sel.length} جروب من \"$lab\" على $batches دفعة (حتى $batch جروب في الدفعة).'
+        '${kindName(kind)}${kind == 'stickers' ? ' (${media.length})' : ''} لكل محادثات المصنف.'
+        '\n\nافتحي المصنف بنفسك في واتساب واتركيه مفتوحاً أمامك، ثم شغّلي الفقاعة من الشاشة التالية. '
+        'الفقاعة هتفتح كل محادثة في القائمة واحدة واحدة وتجهّز الرسالة.'
         '${old ? '\nسيتم إغلاق المهمة غير المنتهية السابقة.' : ''}',
-        ok: 'ابدأ');
+        ok: 'متابعة');
     if (!ok || !mounted) return;
     await Bubble.reset();
     Store.data['ujob'] = {
-      'label': lab,
       'kind': kind,
       'text': (kind == 'text' || kind == 'imageText') ? text.text.trim() : '',
       'media': kind == 'text' ? <String>[] : media,
-      'items': sel,
-      'st': List<String>.filled(sel.length, 'pending'),
-      'batch': batch,
+      'items': <String>[],
+      'st': <String>[],
       'finished': false,
     };
     _save();
@@ -2686,13 +2888,10 @@ class _LabelTabState extends State<LabelTab> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     final t = Theme.of(context);
-    final cats = Wa.cats;
-    final lab = _label;
-    final names = _names;
     final lim = kLimit[kind]!;
     final job = Store.ujob;
     return Scaffold(
-      appBar: AppBar(title: const Text('رسالة موحدة لمصنف'), actions: [
+      appBar: AppBar(title: const Text('رسالة لمصنف'), actions: [
         IconButton(
             tooltip: 'إعدادات التطبيق',
             onPressed: () => showAppSettings(context, () {
@@ -2703,160 +2902,51 @@ class _LabelTabState extends State<LabelTab> with WidgetsBindingObserver {
       body: !ready
           ? const Center(child: CircularProgressIndicator())
           : ListView(padding: const EdgeInsets.all(16), children: [
-              if (job != null) ...[
-                Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(12),
-                    child: Column(children: [
-                      Text(
-                          'مهمة مصنف غير منتهية (${job['label']}): ${(job['st'] as List).where((s) => s != 'pending').length} من ${(job['st'] as List).length}'),
-                      const SizedBox(height: 8),
-                      FilledButton(
-                          onPressed: () async {
-                            await Navigator.push(
-                                context,
-                                MaterialPageRoute(
-                                    builder: (_) => const LabelSendScreen()));
-                            if (mounted) setState(() {});
-                          },
-                          child: const Text('استكمال الإرسال')),
-                    ]),
-                  ),
-                ),
-                const SizedBox(height: 8),
-              ],
-              const Card(
+              Card(
                 child: Padding(
-                  padding: EdgeInsets.all(12),
-                  child: Text(
-                      'اكتبي الرسالة مرة واحدة واختاري المصنف. التطبيق يرتب جروباته على دفعات، والفقاعة تكتب اسم كل جروب في بحث واتساب، وأنتِ تعلّمين عليه وتضغطين إرسال لكل دفعة.'),
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('إزاي بيشتغل؟', style: t.textTheme.titleSmall),
+                        const SizedBox(height: 6),
+                        const Text(
+                            '١) افتحي المصنف بنفسك في واتساب واتركيه مفتوحاً.\n'
+                            '٢) ارجعي هنا واضغطي "تجهيز الإرسال للمصنف".\n'
+                            '٣) الفقاعة هتفتح كل محادثة في القائمة اللي قدامك واحدة واحدة وتجهّز الرسالة، وإنتِ بس تراجعي وتبعتي.'),
+                      ]),
                 ),
               ),
-              const SizedBox(height: 8),
-              if (cats.isEmpty)
-                Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(12),
-                    child: Column(children: [
-                      const Text(
-                          'لا توجد مصنفات محفوظة. من شاشة أسماء الجروبات الصقي أسماء جروبات المصنف مع اسم التصنيف.'),
-                      const SizedBox(height: 8),
-                      OutlinedButton.icon(
-                        onPressed: () async {
-                          await Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                  builder: (_) =>
-                                      const WaGroupsScreen(groups: [])));
-                          if (mounted) setState(() {});
-                        },
-                        icon: const Icon(Icons.groups),
-                        label: const Text('إضافة مصنف'),
-                      ),
-                    ]),
-                  ),
-                )
-              else ...[
-                Text('المصنف', style: t.textTheme.titleMedium),
+              if (job != null) ...[
                 const SizedBox(height: 8),
-                Wrap(spacing: 8, runSpacing: 8, children: [
-                  for (final e in cats.entries)
-                    ChoiceChip(
-                      label: Text('${e.key} (${e.value.length})'),
-                      selected: lab == e.key,
-                      onSelected: (_) {
-                        setState(() {
-                          label = e.key;
-                          off.clear();
-                        });
-                        _save();
-                      },
-                    ),
-                ]),
-              ],
-              if (lab != null) ...[
-                const SizedBox(height: 8),
-                Card(
-                  child: ExpansionTile(
-                    title: Text('الجروبات: ${_chosen.length} من ${names.length}'),
-                    subtitle: const Text('اضغطي لاستبعاد جروبات من هذه الرسالة'),
-                    children: [
-                      Row(children: [
-                        TextButton(
-                            onPressed: () {
-                              setState(off.clear);
-                              _save();
-                            },
-                            child: const Text('تحديد الكل')),
-                        TextButton(
-                            onPressed: () {
-                              setState(() => off.addAll(names));
-                              _save();
-                            },
-                            child: const Text('إلغاء الكل')),
-                      ]),
-                      for (final n in names)
-                        CheckboxListTile(
-                          dense: true,
-                          controlAffinity: ListTileControlAffinity.leading,
-                          value: !off.contains(n),
-                          title: Text(n),
-                          onChanged: (v) {
-                            setState(() {
-                              if (v == true) {
-                                off.remove(n);
-                              } else {
-                                off.add(n);
-                              }
-                            });
-                            _save();
-                          },
-                        ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(12),
-                    child: Row(children: [
-                      const Expanded(
-                          child: Text(
-                              'عدد الجروبات في كل دفعة (واتساب يسمح غالباً بـ 5 في المشاركة الواحدة)')),
-                      IconButton(
-                          onPressed: batch > 1
-                              ? () {
-                                  setState(() => batch--);
-                                  _save();
-                                }
-                              : null,
-                          icon: const Icon(Icons.remove_circle_outline)),
-                      Text('$batch', style: t.textTheme.titleLarge),
-                      IconButton(
-                          onPressed: batch < 30
-                              ? () {
-                                  setState(() => batch++);
-                                  _save();
-                                }
-                              : null,
-                          icon: const Icon(Icons.add_circle_outline)),
-                    ]),
-                  ),
+                FilledButton.tonalIcon(
+                  onPressed: () async {
+                    await Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                            builder: (_) => const LabelSendScreen()));
+                    if (mounted) setState(() {});
+                  },
+                  icon: const Icon(Icons.play_arrow),
+                  label: Text(
+                      'استكمال مهمة المصنف غير المنتهية (${(job['st'] as List).where((x) => x != 'pending').length} من ${(job['st'] as List).length})'),
                 ),
               ],
-              const Divider(height: 32),
-              for (final k in kKinds.keys)
-                ListTile(
-                  selected: kind == k,
-                  leading: Icon(kind == k
-                      ? Icons.radio_button_checked
-                      : Icons.radio_button_off),
-                  title: Text(kKinds[k]!, style: t.textTheme.titleMedium),
-                  onTap: () => _setKind(k),
-                ),
-              const Divider(),
+              const SizedBox(height: 12),
+              SegmentedButton<String>(
+                segments: [
+                  for (final k in kKinds.keys)
+                    ButtonSegment(
+                        value: k,
+                        label: Text(kKindsShort[k]!,
+                            overflow: TextOverflow.ellipsis)),
+                ],
+                selected: {kind},
+                showSelectedIcon: false,
+                onSelectionChanged: (v) => _setKind(v.first),
+              ),
               if (kind == 'text' || kind == 'imageText') ...[
-                const SizedBox(height: 8),
+                const SizedBox(height: 12),
                 TextField(
                   controller: text,
                   minLines: 4,
@@ -2867,63 +2957,68 @@ class _LabelTabState extends State<LabelTab> with WidgetsBindingObserver {
                 ),
               ],
               if (lim > 0) ...[
-                const SizedBox(height: 16),
-                Wrap(spacing: 12, runSpacing: 12, children: [
-                  for (var i = 0; i < media.length; i++)
-                    Stack(children: [
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(12),
-                        child: Container(
-                          width: 120,
-                          height: 120,
-                          color: Colors.black12,
-                          child: Image.file(File(media[i]),
-                              width: 120,
-                              height: 120,
-                              fit: kind == 'stickers'
-                                  ? BoxFit.contain
-                                  : BoxFit.cover,
-                              cacheWidth: 300,
-                              errorBuilder: (_, __, ___) =>
-                                  const Center(child: Icon(Icons.broken_image))),
-                        ),
-                      ),
-                      PositionedDirectional(
-                        top: 0,
-                        end: 0,
-                        child: IconButton.filled(
-                          iconSize: 18,
-                          onPressed: () {
-                            setState(() => media.removeAt(i));
-                            _save();
-                          },
-                          icon: const Icon(Icons.close),
-                        ),
-                      ),
-                    ]),
-                ]),
                 const SizedBox(height: 12),
-                if (media.length < lim) ...[
-                  if (kind != 'stickers') ...[
-                    OutlinedButton.icon(
-                      onPressed: _gallery,
-                      icon: const Icon(Icons.photo_library),
-                      label: const Text('اختيار من معرض الصور'),
-                    ),
-                    const SizedBox(height: 8),
-                  ],
-                  OutlinedButton.icon(
-                    onPressed: _browse,
-                    icon: Icon(kind == 'stickers'
-                        ? Icons.emoji_emotions
-                        : Icons.folder_open),
-                    label: Text(kind == 'stickers'
-                        ? 'إضافة استيكرات (${media.length}) — آخر مجلد محفوظ'
-                        : 'اختيار من مجلد — آخر مجلد محفوظ'),
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          if (media.isNotEmpty) ...[
+                            Wrap(spacing: 12, runSpacing: 12, children: [
+                              for (var i = 0; i < media.length; i++)
+                                Stack(children: [
+                                  ClipRRect(
+                                    borderRadius: BorderRadius.circular(12),
+                                    child: Container(
+                                      width: 120,
+                                      height: 120,
+                                      color: Colors.black12,
+                                      child: Image.file(File(media[i]),
+                                          width: 120,
+                                          height: 120,
+                                          fit: kind == 'stickers'
+                                              ? BoxFit.contain
+                                              : BoxFit.cover,
+                                          cacheWidth: 300,
+                                          errorBuilder: (_, __, ___) =>
+                                              const Center(
+                                                  child: Icon(
+                                                      Icons.broken_image))),
+                                    ),
+                                  ),
+                                  PositionedDirectional(
+                                    top: 0,
+                                    end: 0,
+                                    child: IconButton.filled(
+                                      iconSize: 18,
+                                      onPressed: () {
+                                        setState(() => media.removeAt(i));
+                                        _save();
+                                      },
+                                      icon: const Icon(Icons.close),
+                                    ),
+                                  ),
+                                ]),
+                            ]),
+                            const SizedBox(height: 10),
+                          ],
+                          if (media.length < lim)
+                            OutlinedButton.icon(
+                              onPressed: _addChooser,
+                              icon: const Icon(Icons.add),
+                              label: Text(kind == 'stickers'
+                                  ? 'إضافة استيكرات (${media.length})'
+                                  : 'إضافة صورة'),
+                            )
+                          else
+                            Text('وصلتي للحد الأقصى (${media.length})',
+                                style: t.textTheme.bodySmall),
+                        ]),
                   ),
-                ],
+                ),
               ],
-              const SizedBox(height: 24),
+              const SizedBox(height: 16),
               FilledButton.icon(
                   onPressed: _start,
                   icon: const Icon(Icons.play_arrow),
@@ -2966,7 +3061,6 @@ class _LabelSendScreenState extends State<LabelSendScreen>
 
   List get _items => job['items'] as List;
   List get _st => job['st'] as List;
-  int get _bs => ((job['batch'] as int?) ?? 5).clamp(1, 30).toInt();
   int _count(String s) => _st.where((x) => x == s).length;
   List<String> get _media =>
       (job['media'] as List).map((e) => e.toString()).toList();
@@ -2986,9 +3080,9 @@ class _LabelSendScreenState extends State<LabelSendScreen>
     return true;
   }
 
-  Future<void> _startBubble(int at) async {
+  Future<void> _startBubble() async {
     if (!_mediaOk()) return;
-    final err = await Bubble.start(labelSession(job), at);
+    final err = await Bubble.start(labelSession(job), -1);
     if (!mounted) return;
     if (err != null) {
       snack(context, err);
@@ -3021,7 +3115,7 @@ class _LabelSendScreenState extends State<LabelSendScreen>
 
   Future<void> _finish() async {
     final ok = await ask(context, 'إنهاء المهمة',
-        'المتبقي: ${_count('pending')} جروب. سيتم إغلاق المهمة والفقاعة.',
+        'المتبقي: ${_count('pending')} محادثة. سيتم إغلاق المهمة والفقاعة.',
         ok: 'إنهاء');
     if (!ok) return;
     await Bubble.reset();
@@ -3040,58 +3134,62 @@ class _LabelSendScreenState extends State<LabelSendScreen>
   @override
   Widget build(BuildContext context) {
     final t = Theme.of(context);
-    final total = _items.length;
     final done = _count('done'), skipped = _count('skipped');
-    final cur = _st.indexOf('pending');
-    final bs = _bs;
+    final total = _items.length;
     final media = _media;
     final body = (job['text'] as String).trim();
-    final batches = (total / bs).ceil();
 
     return Scaffold(
-      appBar: AppBar(title: Text('مصنف: ${job['label']}'), actions: [
+      appBar: AppBar(title: const Text('إرسال للمصنف المفتوح'), actions: [
         IconButton(
             tooltip: 'إنهاء المهمة',
             onPressed: _finish,
             icon: const Icon(Icons.stop_circle_outlined)),
       ]),
       body: ListView(padding: const EdgeInsets.all(16), children: [
-        LinearProgressIndicator(
-            value: total == 0 ? 0 : (done + skipped) / total, minHeight: 8),
-        const SizedBox(height: 8),
-        Text(
-            'تم $done  •  تخطي $skipped  •  متبقي ${_count('pending')}  (من $total في $batches دفعة)'),
-        const SizedBox(height: 12),
-        if (cur < 0) ...[
-          const SizedBox(height: 12),
-          const Icon(Icons.check_circle, size: 72, color: Colors.green),
-          const SizedBox(height: 12),
-          Text('اكتمل المرور على كل الجروبات',
-              textAlign: TextAlign.center, style: t.textTheme.titleLarge),
-          const SizedBox(height: 16),
-          FilledButton(onPressed: _finish, child: const Text('إنهاء المهمة')),
-        ] else ...[
-          BubbleCard(
-              startLabel:
-                  started ? 'استكمال بالفقاعة' : 'تشغيل الفقاعة من الجروب ${cur + 1}',
-              onStart: () => _startBubble(cur)),
-          const SizedBox(height: 8),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Text(
-                  'في واتساب: اضغطي الفقاعة فيُكتب اسم الجروب في البحث، علّمي عليه، ثم اضغطي الفقاعة للجروب التالي. '
-                  'بعد آخر جروب في الدفعة اضغطي إرسال في واتساب، ثم الفقاعة لتبدأ الدفعة التالية. '
-                  'اضغطي الفقاعة مطولاً للتخطي أو إعادة الكتابة أو الإغلاق.',
-                  style: t.textTheme.bodyMedium),
-            ),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child:
+                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                Expanded(
+                    child: Text('تم $done  •  تخطي $skipped',
+                        style: t.textTheme.titleSmall)),
+                if (total > 0)
+                  Text('$total محادثة', style: t.textTheme.bodySmall),
+              ]),
+              const SizedBox(height: 6),
+              Text('المحادثات بتظهر هنا أول بأول مع كل واحدة بتفتحها الفقاعة.',
+                  style: t.textTheme.bodySmall),
+            ]),
           ),
-          const SizedBox(height: 8),
-          OutlinedButton.icon(
-              onPressed: _manualShare,
-              icon: const Icon(Icons.chat),
-              label: const Text('فتح واتساب بالرسالة (يدوي)')),
-        ],
+        ),
+        const SizedBox(height: 8),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child:
+                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('قبل التشغيل:', style: t.textTheme.titleSmall),
+              const SizedBox(height: 6),
+              const Text(
+                  'افتحي المصنف في واتساب واتركيه مفتوحاً قدامك، ثم اضغطي زر التشغيل بالأسفل. '
+                  'الفقاعة هتفتح كل محادثة في القائمة وتجهّز الرسالة. بعد كل إرسال اضغطي "التالي" في الفقاعة.'),
+            ]),
+          ),
+        ),
+        const SizedBox(height: 8),
+        BubbleCard(
+            startLabel: started
+                ? 'استكمال بالفقاعة'
+                : 'تشغيل الفقاعة على المصنف المفتوح',
+            onStart: _startBubble),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+            onPressed: _manualShare,
+            icon: const Icon(Icons.chat),
+            label: const Text('فتح واتساب بالرسالة (يدوي)')),
         const SizedBox(height: 8),
         Card(
           child: Padding(
@@ -3101,8 +3199,8 @@ class _LabelSendScreenState extends State<LabelSendScreen>
                 Padding(
                   padding: const EdgeInsetsDirectional.only(end: 8),
                   child: Image.file(File(m),
-                      width: 48,
-                      height: 48,
+                      width: 40,
+                      height: 40,
                       cacheWidth: 100,
                       errorBuilder: (_, __, ___) =>
                           const Icon(Icons.broken_image)),
@@ -3112,38 +3210,23 @@ class _LabelSendScreenState extends State<LabelSendScreen>
                       body.isEmpty
                           ? kindName(job['kind'] as String)
                           : '${kindName(job['kind'] as String)}: $body',
-                      maxLines: 3,
-                      overflow: TextOverflow.ellipsis)),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: t.textTheme.bodySmall)),
             ]),
           ),
         ),
-        const SizedBox(height: 8),
-        for (var b = 0; b < batches; b++) ...[
-          Padding(
-            padding: const EdgeInsets.only(top: 12, bottom: 4),
-            child: Text('الدفعة ${b + 1}', style: t.textTheme.titleSmall),
-          ),
-          for (var i = b * bs;
-              i < ((b + 1) * bs < total ? (b + 1) * bs : total);
-              i++)
+        if (total > 0) ...[
+          const SizedBox(height: 12),
+          Text('المحادثات', style: t.textTheme.titleSmall),
+          for (var i = 0; i < total; i++)
             ListTile(
               dense: true,
               leading: _icon(_st[i] as String),
               title: Text(_items[i].toString()),
-              onTap: () async {
-                await Clipboard.setData(ClipboardData(text: _items[i].toString()));
-                if (context.mounted) snack(context, 'تم نسخ الاسم');
-              },
               trailing: PopupMenuButton<String>(
-                onSelected: (v) {
-                  if (v == 'start') {
-                    _startBubble(i);
-                  } else {
-                    _setSt(i, v);
-                  }
-                },
+                onSelected: (v) => _setSt(i, v),
                 itemBuilder: (_) => const [
-                  PopupMenuItem(value: 'start', child: Text('ابدأ الفقاعة من هنا')),
                   PopupMenuItem(value: 'done', child: Text('تعليم: تم')),
                   PopupMenuItem(value: 'skipped', child: Text('تعليم: تخطي')),
                   PopupMenuItem(value: 'pending', child: Text('إعادته للمعلّق')),
