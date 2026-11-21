@@ -229,9 +229,13 @@ jobs:
               val pkg: String,
               val text: String,
               val media: List<String>,
-              val items: List<SItem>,
+              val items: MutableList<SItem>,
               var idx: Int,
-              var active: Boolean
+              var active: Boolean,
+              /** وضع المصنف المفتوح: أسماء المحادثات التي فُتحت بالفعل حتى لا تتكرر. */
+              val seen: MutableSet<String> = mutableSetOf(),
+              /** وضع المصنف المفتوح: true عند الوصول لنهاية القائمة. */
+              var lwDone: Boolean = false
           ) {
               fun toJson(): String {
                   val o = JSONObject()
@@ -252,6 +256,8 @@ jobs:
                   o.put("items", a)
                   o.put("idx", idx)
                   o.put("active", active)
+                  if (seen.isNotEmpty()) o.put("seen", JSONArray(seen.toList()))
+                  o.put("lwDone", lwDone)
                   return o.toString()
               }
 
@@ -264,6 +270,9 @@ jobs:
                   val a = JSONArray()
                   for (x in items) a.put(x.st)
                   o.put("st", a)
+                  val tt = JSONArray()
+                  for (x in items) tt.put(x.title)
+                  o.put("tt", tt)
                   return o.toString()
               }
 
@@ -290,6 +299,11 @@ jobs:
                       }
                       val rawPkg = o.optString("pkg", ShareUtil.BUSINESS)
                       val pkg = if (rawPkg == ShareUtil.NORMAL) ShareUtil.NORMAL else ShareUtil.BUSINESS
+                      val seen = mutableSetOf<String>()
+                      val sv = o.optJSONArray("seen")
+                      if (sv != null) {
+                          for (i in 0 until sv.length()) seen.add(sv.getString(i))
+                      }
                       return Sess(
                           o.optString("id", "job"),
                           o.optString("mode", "review"),
@@ -298,7 +312,9 @@ jobs:
                           media,
                           items,
                           o.optInt("idx", -1),
-                          o.optBoolean("active", true)
+                          o.optBoolean("active", true),
+                          seen,
+                          o.optBoolean("lwDone", false)
                       )
                   }
               }
@@ -454,7 +470,9 @@ jobs:
 
               private var token = 0
               private var noteText: String? = null
-              private var lastAct = 0L
+              private var lastAdvance = 0L
+              private var lastPrepare = 0L
+              private var lwToken = 0
 
               // حالة البحث النشط (تُغذّى فورياً من onAccessibilityEvent + مؤقت احتياطي)
               private var pActive = false
@@ -531,6 +549,16 @@ jobs:
                   val s = Sess.parse(json)
                   s.active = true
                   sess = s
+                  if (s.mode == "listwalk") {
+                      s.lwDone = false
+                      s.idx = if (s.items.isEmpty()) -1 else s.items.indexOfFirst { x -> x.st == 0 }
+                      noteText = null
+                      save()
+                      hideAll()
+                      showBubble()
+                      note("افتح المصنف في واتساب ثم اضغط التالي ◀")
+                      return
+                  }
                   var i = at
                   if (i < 0 || i >= s.items.size) i = s.items.indexOfFirst { x -> x.st == 0 }
                   s.idx = i
@@ -562,8 +590,12 @@ jobs:
               private fun advance(st: Int) {
                   val s = sess ?: return
                   val now = System.currentTimeMillis()
-                  if (now - lastAct < 550) return
-                  lastAct = now
+                  if (now - lastAdvance < 550) return
+                  lastAdvance = now
+                  if (s.mode == "listwalk") {
+                      listwalkAdvance(s, st)
+                      return
+                  }
                   if (s.idx < 0 || s.idx >= s.items.size) {
                       stopSession()
                       return
@@ -579,6 +611,128 @@ jobs:
                   } else {
                       openCurrent(false)
                   }
+              }
+
+              /** وضع المصنف المفتوح: يعلّم الحالية، يرجع من المحادثة للقائمة، ويفتح أول محادثة لم تُفتح. */
+              private fun listwalkAdvance(s: Sess, st: Int) {
+                  if (s.lwDone) {
+                      stopSession()
+                      return
+                  }
+                  val cur = s.items.getOrNull(s.idx)
+                  if (cur != null && cur.st == 0) {
+                      cur.st = st
+                      save()
+                  }
+                  val root = rootInActiveWindow
+                  if (root != null && root.packageName?.toString() == targetPkg() && findChatInput(root) != null) {
+                      performGlobalAction(GLOBAL_ACTION_BACK)
+                  }
+                  noteText = null
+                  lwToken++
+                  val my = lwToken
+                  h.postDelayed({ lwStep(s, my, 0) }, 600)
+              }
+
+              /** يفتح أول محادثة ظاهرة في قائمة المصنف لم تُفتح بعد، مع التمرير للأسفل عند الحاجة. */
+              private fun lwStep(s: Sess, my: Int, scrolls: Int) {
+                  if (my != lwToken) return
+                  if (sess !== s || !s.active) return
+                  val root = rootInActiveWindow
+                  if (root == null || root.packageName?.toString() != targetPkg()) {
+                      note("افتح واتساب والمصنف الأول")
+                      return
+                  }
+                  val rows = collectRows(root)
+                  for (row in rows) {
+                      val name = rowName(row)
+                      if (name.isNotEmpty() && !s.seen.contains(name)) {
+                          s.seen.add(name)
+                          s.items.add(SItem(name, name, false, 0))
+                          s.idx = s.items.size - 1
+                          save()
+                          clickNode(row)
+                          note("فتحت: " + name)
+                          render()
+                          return
+                      }
+                  }
+                  if (scrolls < 30 && scrollListForward(root)) {
+                      h.postDelayed({ lwStep(s, my, scrolls + 1) }, 450)
+                  } else {
+                      s.lwDone = true
+                      save()
+                      note("اكتملت القائمة ✓")
+                      render()
+                  }
+              }
+
+              /** صفوف المحادثات الظاهرة في القائمة، مرتبة من الأعلى للأسفل. */
+              private fun collectRows(root: AccessibilityNodeInfo): List<AccessibilityNodeInfo> {
+                  val out = ArrayList<AccessibilityNodeInfo>()
+                  fun walk(n: AccessibilityNodeInfo?, depth: Int) {
+                      if (n == null || depth > 40) return
+                      val id = n.viewIdResourceName ?: ""
+                      if (n.isVisibleToUser && id.contains("conversations_row", true)) {
+                          out.add(n)
+                          return
+                      }
+                      for (i in 0 until n.childCount) walk(n.getChild(i), depth + 1)
+                  }
+                  walk(root, 0)
+                  if (out.isEmpty()) {
+                      // احتياطي: عناصر قابلة للضغط لها وصف داخل قائمة قابلة للتمرير
+                      fun walk2(n: AccessibilityNodeInfo?, depth: Int, inList: Boolean) {
+                          if (n == null || depth > 40) return
+                          val cls = n.className?.toString() ?: ""
+                          val list = inList || cls.contains("RecyclerView") || cls.contains("ListView")
+                          if (list && n.isVisibleToUser && n.isClickable && !n.contentDescription.isNullOrEmpty()) {
+                              out.add(n)
+                              return
+                          }
+                          for (i in 0 until n.childCount) walk2(n.getChild(i), depth + 1, list)
+                      }
+                      walk2(root, 0, false)
+                  }
+                  return out.sortedBy {
+                      val b = android.graphics.Rect()
+                      it.getBoundsInScreen(b)
+                      b.top * 10000 + b.left
+                  }
+              }
+
+              /** اسم المحادثة من صف القائمة: أول جزء من الوصف قبل آخر رسالة/الوقت. */
+              private fun rowName(n: AccessibilityNodeInfo): String {
+                  val d = n.contentDescription?.toString() ?: ""
+                  if (d.isNotEmpty()) return d.substringBefore(',').substringBefore('\n').trim()
+                  fun firstText(x: AccessibilityNodeInfo?, depth: Int): String {
+                      if (x == null || depth > 12) return ""
+                      val t = x.text?.toString() ?: ""
+                      if (t.isNotEmpty()) return t
+                      for (i in 0 until x.childCount) {
+                          val r = firstText(x.getChild(i), depth + 1)
+                          if (r.isNotEmpty()) return r
+                      }
+                      return ""
+                  }
+                  return firstText(n, 0).substringBefore('\n').trim()
+              }
+
+              /** يمرر قائمة المحادثات للأسفل خطوة. يرجع false عند نهاية القائمة. */
+              private fun scrollListForward(root: AccessibilityNodeInfo): Boolean {
+                  var target: AccessibilityNodeInfo? = null
+                  fun walk(n: AccessibilityNodeInfo?, depth: Int) {
+                      if (n == null || depth > 40 || target != null) return
+                      val cls = n.className?.toString() ?: ""
+                      if (n.isVisibleToUser && (cls.contains("RecyclerView") || cls.contains("ListView")) && n.isScrollable) {
+                          target = n
+                          return
+                      }
+                      for (i in 0 until n.childCount) walk(n.getChild(i), depth + 1)
+                  }
+                  walk(root, 0)
+                  val t = target ?: return false
+                  return t.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
               }
 
               /** يفتح واتساب حسب الوضع (مراجعة في الرئيسية أو مشاركة مباشرة) ثم يبدأ البحث الفوري. */
@@ -632,8 +786,8 @@ jobs:
                   val s = sess ?: return
                   val item = s.items.getOrNull(s.idx) ?: return
                   val now = System.currentTimeMillis()
-                  if (now - lastAct < 550) return
-                  lastAct = now
+                  if (now - lastPrepare < 550) return
+                  lastPrepare = now
                   cancelSearch()
 
                   if (s.media.isEmpty()) {
@@ -878,6 +1032,27 @@ jobs:
                   val a = tv1 ?: return
                   val b = tv2 ?: return
                   val s = sess ?: return
+                  if (s.mode == "listwalk") {
+                      val doneLw = s.items.count { x -> x.st != 0 }
+                      if (s.lwDone) {
+                          a.text = "اكتمل ✓ ($doneLw محادثة)"
+                          b.text = "اضغط إغلاق"
+                          btnPrep?.visibility = View.GONE
+                          btnNext?.text = "إغلاق ✓"
+                      } else if (s.idx < 0 || s.idx >= s.items.size) {
+                          a.text = "المصنف المفتوح ($doneLw)"
+                          b.text = noteText ?: "اضغط التالي بعد فتح المصنف"
+                          btnPrep?.visibility = View.GONE
+                          btnNext?.text = "التالي ◀"
+                      } else {
+                          val cur = s.items[s.idx]
+                          a.text = "${s.idx + 1}  •  ${cur.title}"
+                          b.text = noteText ?: "راجع المحادثة ثم اضغط تجهيز"
+                          btnPrep?.visibility = View.VISIBLE
+                          btnNext?.text = "التالي ◀"
+                      }
+                      return
+                  }
                   val total = s.items.size
                   val done = s.items.count { x -> x.st != 0 }
                   if (s.idx < 0 || s.idx >= total) {
