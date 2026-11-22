@@ -2010,20 +2010,7 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
     }
   }
 
-  String? _validate() {
-    if (kind == 'text' && text.text.trim().isEmpty) return 'اكتبي نص الرسالة';
-    if (kind != 'text' && media.isEmpty) {
-      return kind == 'stickers' ? 'اختاري استيكراً واحداً على الأقل' : 'اختاري صورة';
-    }
-    return null;
-  }
-
   Future<void> _start() async {
-    final v = _validate();
-    if (v != null) {
-      snack(context, v);
-      return;
-    }
     final sel = shown;
     if (sel.isEmpty) {
       snack(context, groups.isEmpty ? 'لا توجد جروبات في ملف Excel' : 'لا توجد جروبات في هذا التصنيف');
@@ -2386,7 +2373,22 @@ class _SendScreenState extends State<SendScreen> with WidgetsBindingObserver {
     if (mounted) setState(() {});
   }
 
+  /// لا شرط اختيار محتوى لبدء الإرسال: ما لا محتوى فيه يُتخطّى عند التنفيذ.
+  bool get _emptyPayload =>
+      (job['text'] as String).trim().isEmpty &&
+      (job['media'] as List).isEmpty;
+
   Future<void> _startBubble(int i) async {
+    if (_emptyPayload) {
+      for (var j = 0; j < _st.length; j++) {
+        if (_st[j] == 'pending') _st[j] = 'skipped';
+      }
+      await Store.save();
+      if (!mounted) return;
+      snack(context, 'لا محتوى للإرسال — تم تخطي الجروبات');
+      setState(() {});
+      return;
+    }
     final media = (job['media'] as List).map((e) => e.toString()).toList();
     for (final m in media) {
       if (!File(m).existsSync()) {
@@ -2415,6 +2417,11 @@ class _SendScreenState extends State<SendScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _open(int i) async {
+    if (_emptyPayload) {
+      snack(context, 'لا محتوى للإرسال — تم تخطي الجروب');
+      await _mark(i, 'skipped');
+      return;
+    }
     final media = (job['media'] as List).map((e) => e.toString()).toList();
     for (final m in media) {
       if (!File(m).existsSync()) {
@@ -3153,22 +3160,9 @@ class _LabelTabState extends State<LabelTab> with WidgetsBindingObserver {
     }
   }
 
-  String? _validate() {
-    if (kind == 'text' && text.text.trim().isEmpty) return 'اكتبي نص الرسالة';
-    if (kind != 'text' && media.isEmpty) {
-      return kind == 'stickers' ? 'اختاري استيكراً واحداً على الأقل' : 'اختاري صورة';
-    }
-    return null;
-  }
-
   /// يجهز مهمة "المصنف المفتوح": هو يفتح المصنف في واتساب بنفسه،
   /// والفقاعة تفتح محادثات القائمة الظاهرة واحدة واحدة وتجهز الرسالة.
   Future<void> _start() async {
-    final v = _validate();
-    if (v != null) {
-      snack(context, v);
-      return;
-    }
     final old = Store.ujob != null;
     final ok = await ask(
         context,
@@ -3381,6 +3375,9 @@ class _LabelSendScreenState extends State<LabelSendScreen>
     if (mounted) setState(() {});
   }
 
+  bool get _emptyPayload =>
+      (job['text'] as String).trim().isEmpty && _media.isEmpty;
+
   bool _mediaOk() {
     for (final m in _media) {
       if (!File(m).existsSync()) {
@@ -3392,6 +3389,10 @@ class _LabelSendScreenState extends State<LabelSendScreen>
   }
 
   Future<void> _startBubble() async {
+    if (_emptyPayload) {
+      snack(context, 'لا محتوى للإرسال — أضيفي نصاً أو صورة أو استيكراً من الشاشة السابقة');
+      return;
+    }
     if (!_mediaOk()) return;
     final err = await Bubble.start(labelSession(job), -1);
     if (!mounted) return;
@@ -3403,6 +3404,10 @@ class _LabelSendScreenState extends State<LabelSendScreen>
   }
 
   Future<void> _manualShare() async {
+    if (_emptyPayload) {
+      snack(context, 'لا محتوى للإرسال — أضيفي نصاً أو صورة أو استيكراً من الشاشة السابقة');
+      return;
+    }
     if (!_mediaOk()) return;
     try {
       await _ch.invokeMethod<bool>('share',
