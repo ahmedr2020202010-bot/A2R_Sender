@@ -1368,6 +1368,306 @@ class _GateState extends State<Gate> with WidgetsBindingObserver {
   }
 }
 
+// ======================= تبويب استيكراتي =======================
+/// مجلد مكتبة الاستيكرات الخاص بالتطبيق (تخزين مشترك يتحكم فيه المستخدم).
+const String kStickerLibDir = '$kDir/stickers';
+
+String _firstExistingDir(List<String> c) {
+  for (final d in c) {
+    if (Directory(d).existsSync()) return d;
+  }
+  return c.isNotEmpty ? c.first : kRoot;
+}
+
+class StickersTab extends StatefulWidget {
+  const StickersTab({super.key});
+  @override
+  State<StickersTab> createState() => _StickersTabState();
+}
+
+class _StickersTabState extends State<StickersTab> {
+  List<File> lib = [];
+  List<dynamic> packs = [];
+  bool busy = false;
+
+  Map get _added =>
+      Store.data['stickerAdded'] is Map ? Store.data['stickerAdded'] as Map : {};
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+  }
+
+  Future<void> _refresh() async {
+    final files = <File>[];
+    try {
+      final d = Directory(kStickerLibDir);
+      if (d.existsSync()) {
+        for (final e in d.listSync(followLinks: false)) {
+          if (e is File &&
+              ['webp', 'png', 'gif', 'jpg', 'jpeg'].contains(
+                  p.extension(e.path).toLowerCase().replaceFirst('.', ''))) {
+            files.add(e);
+          }
+        }
+        files.sort(
+            (a, b) => a.lastModifiedSync().compareTo(b.lastModifiedSync()));
+      }
+    } catch (_) {}
+    var ps = <dynamic>[];
+    try {
+      final r = await _ch.invokeMethod<String>('packList');
+      if (r != null && r.isNotEmpty) ps = jsonDecode(r) as List;
+    } catch (_) {}
+    if (mounted) setState(() { lib = files; packs = ps; });
+  }
+
+  Future<void> _import() async {
+    if (await prepareFolder() != null) {
+      await Perm.reqStorage();
+      return;
+    }
+    if (!mounted) return;
+    final res = await Navigator.push<List<String>>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => MediaBrowser(
+          title: 'استيراد استيكرات',
+          storeKey: 'dirSticker',
+          fallbackDir: _firstExistingDir(WaApp.stickerDirs()),
+          exts: const ['webp', 'png', 'gif'],
+          max: 200,
+        ),
+      ),
+    );
+    if (res == null || res.isEmpty) return;
+    var ok = 0, failed = 0;
+    final d = Directory(kStickerLibDir);
+    await d.create(recursive: true);
+    for (final src in res) {
+      try {
+        final ext = p.extension(src).toLowerCase();
+        final dest =
+            p.join(d.path, '${DateTime.now().microsecondsSinceEpoch}_$ok$ext');
+        await File(src).copy(dest);
+        ok++;
+      } catch (_) {
+        failed++;
+      }
+    }
+    await _refresh();
+    if (mounted) {
+      snack(context,
+          failed == 0 ? 'تم استيراد $ok استيكر للمكتبة' : 'تم استيراد $ok وتعذر $failed');
+    }
+  }
+
+  Future<void> _buildPacks() async {
+    if (lib.isEmpty) {
+      snack(context, 'المكتبة فارغة — استوردي استيكرات أولاً');
+      return;
+    }
+    setState(() => busy = true);
+    try {
+      final r = await _ch.invokeMethod<String>('buildPacks',
+          {'paths': lib.map((f) => f.path).toList()});
+      final ps = r == null || r.isEmpty ? <dynamic>[] : jsonDecode(r) as List;
+      setState(() => packs = ps);
+      snack(context, 'تم تجهيز ${ps.length} حزمة — أضيفيها لواتساب من القائمة');
+    } on PlatformException catch (e) {
+      snack(context, 'تعذر تجهيز الحزم: ${e.message}');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> _addPack(Map pk) async {
+    try {
+      await _ch.invokeMethod<bool>('addPack',
+          {'id': pk['id'], 'name': pk['name'], 'pkg': WaApp.pkg});
+      final m = Map<String, dynamic>.from(_added);
+      m['${pk['id']}'] = pk['version'];
+      Store.data['stickerAdded'] = m;
+      await Store.save();
+      if (mounted) setState(() {});
+    } on PlatformException catch (e) {
+      if (mounted) {
+        snack(
+            context,
+            e.code == 'NO_WA_BUSINESS'
+                ? '${WaApp.label} غير مثبت على هذا الهاتف'
+                : 'تعذر فتح واتساب: ${e.message}');
+      }
+    }
+  }
+
+  Future<void> _removeSticker(File f) async {
+    final ok = await ask(context, 'حذف من المكتبة',
+        'حذف هذا الاستيكر من المكتبة؟ (الحزم المضافة لواتساب لا تتغير حتى تحديثيها)',
+        ok: 'حذف');
+    if (!ok) return;
+    try {
+      await f.delete();
+    } catch (_) {}
+    await _refresh();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context);
+    return Scaffold(
+      appBar: AppBar(title: Row(children: [
+        const Text('استيكراتي'),
+        const SizedBox(width: 8),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+          decoration: BoxDecoration(
+            color: t.colorScheme.primary,
+            borderRadius: BorderRadius.circular(999),
+          ),
+          child: Text('${lib.length} استيكر',
+              style: TextStyle(color: t.colorScheme.onPrimary, fontSize: 11.5)),
+        ),
+      ])),
+      body: ListView(padding: const EdgeInsets.all(16), children: [
+        if (busy) const LinearProgressIndicator(),
+        Row(children: [
+          Expanded(
+            child: OutlinedButton.icon(
+                onPressed: busy ? null : _import,
+                icon: const Icon(Icons.download),
+                label: const Text('استيراد من المجلدات')),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: FilledButton.icon(
+                onPressed: busy ? null : _buildPacks,
+                icon: const Icon(Icons.add_to_photos),
+                label: const Text('إضافة إلى واتساب')),
+          ),
+        ]),
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('المكتبة', style: t.textTheme.titleMedium),
+                  const SizedBox(height: 4),
+                  Text('مجلد A2R_Sender/stickers',
+                      style: t.textTheme.bodySmall),
+                  const SizedBox(height: 10),
+                  if (lib.isEmpty)
+                    Text('لا توجد استيكرات بعد — استوردي من مجلدات الهاتف.',
+                        style: t.textTheme.bodySmall)
+                  else
+                    GridView.builder(
+                      shrinkWrap: true,
+                      physics: const NeverScrollableScrollPhysics(),
+                      gridDelegate:
+                          const SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: 4,
+                              mainAxisSpacing: 8,
+                              crossAxisSpacing: 8),
+                      itemCount: lib.length,
+                      itemBuilder: (_, i) => GestureDetector(
+                        onLongPress: () => _removeSticker(lib[i]),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: Container(
+                            color: t.colorScheme.surfaceContainerHighest,
+                            child: Image.file(lib[i], fit: BoxFit.contain,
+                                errorBuilder: (_, __, ___) => const Center(
+                                    child: Icon(Icons.broken_image))),
+                          ),
+                        ),
+                      ),
+                    ),
+                  if (lib.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    Text('ضغطة مطوّلة على أي استيكر لحذفه من المكتبة.',
+                        style: t.textTheme.bodySmall),
+                  ],
+                ]),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Container(
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            color: const Color(0xFFFDF6E4),
+            border: Border.all(color: const Color(0xFFF0DFAE)),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: const Text(
+              'استيكر ناقص من واتساب؟ ابعتيه مرة في أي شات أو انسخيه لمجلد المكتبة — واتساب لا يخزن كل المستلم على التخزين المشترك.',
+              style: TextStyle(fontSize: 12, color: Color(0xFF7A5B13))),
+        ),
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('الحزم في واتساب', style: t.textTheme.titleMedium),
+                  const SizedBox(height: 4),
+                  Text('كل حزمة حتى ٣٠ استيكر (حد واتساب الرسمي).',
+                      style: t.textTheme.bodySmall),
+                  const SizedBox(height: 8),
+                  if (packs.isEmpty)
+                    Text('جهزي مكتبتك ثم اضغطي «إضافة إلى واتساب».',
+                        style: t.textTheme.bodySmall)
+                  else
+                    for (final pk in packs.cast<Map>()) ...[
+                      Builder(builder: (_) {
+                        final addedV = _added['${pk['id']}'];
+                        final upToDate = addedV != null && addedV == pk['version'];
+                        return ListTile(
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          leading: CircleAvatar(
+                              backgroundColor: t.colorScheme.primary,
+                              child: const Text('A2R',
+                                  style: TextStyle(
+                                      color: Colors.white, fontSize: 11))),
+                          title: Text('${pk['name']}'),
+                          subtitle: Text(
+                              '${pk['count']} استيكر${upToDate ? ' — مضافة' : addedV != null ? ' — تغيّرت بعد الإضافة' : ' — لم تُضف'}'),
+                          trailing: upToDate
+                              ? Text('✓ في واتساب',
+                                  style: TextStyle(
+                                      color: t.colorScheme.primary,
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 12))
+                              : TextButton(
+                                  onPressed: busy ? null : () => _addPack(pk),
+                                  child: Text(addedV != null ? 'تحديث' : 'إضافة')),
+                        );
+                      }),
+                    ],
+                ]),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Container(
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            color: const Color(0xFFFDF6E4),
+            border: Border.all(color: const Color(0xFFF0DFAE)),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: const Text(
+              'الإرسال التلقائي للنصوص والصور يعمل كما هو دون تغيير. الاستيكر الحقيقي يُرسل من لوحة واتساب بعد إضافة الحزمة.',
+              style: TextStyle(fontSize: 12, color: Color(0xFF7A5B13))),
+        ),
+      ]),
+    );
+  }
+}
+
 // ======================= الهيكل: تابان =======================
 class Shell extends StatefulWidget {
   const Shell({super.key});
@@ -1381,7 +1681,8 @@ class _ShellState extends State<Shell> {
   Widget build(BuildContext context) {
     final kb = MediaQuery.of(context).viewInsets.bottom > 0;
     return Scaffold(
-      body: IndexedStack(index: tab, children: const [Home(), LabelTab()]),
+      body: IndexedStack(
+          index: tab, children: const [Home(), LabelTab(), StickersTab()]),
       bottomNavigationBar: kb
           ? null
           : NavigationBar(
@@ -1392,6 +1693,9 @@ class _ShellState extends State<Shell> {
                     icon: Icon(Icons.send), label: 'إرسال لكل جروب'),
                 NavigationDestination(
                     icon: Icon(Icons.label_outline), label: 'رسالة لمصنف'),
+                NavigationDestination(
+                    icon: Icon(Icons.sticky_note_2_outlined),
+                    label: 'استيكراتي'),
               ],
             ),
     );
@@ -1945,6 +2249,13 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
           showSelectedIcon: false,
           onSelectionChanged: (v) => _setKind(v.first),
         ),
+        if (kind == 'stickers')
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text(
+                'الاستيكرات هنا تُرسل كصور. لإرسالها كاستيكر حقيقي: تبويب «استيكراتي».',
+                style: t.textTheme.bodySmall),
+          ),
         if (kind == 'text' || kind == 'imageText') ...[
           const SizedBox(height: 12),
           TextField(
