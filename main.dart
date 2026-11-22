@@ -440,6 +440,54 @@ Future<String> persistMedia(String src) async {
   return dest;
 }
 
+// ======================= الاستيكر الحقيقي (وضع تجريبي) =======================
+/// عدد الاستيكرات في الحزمة الواحدة — يجب أن يطابق StickerPacks.LIMIT في الكوتلن.
+const int kStickerPackLimit = 30;
+
+/// بصمة محتوى ملف: الطول + FNV-1a 64 بت.
+/// للمطابقة بين مكتبة الاستيكرات ووسائط المهمة بدون الاعتماد على المسارات.
+String contentFingerprint(List<int> b) {
+  var h = 0xcbf29ce484222325;
+  for (final x in b) {
+    h ^= x;
+    h = (h * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF;
+  }
+  return '${b.length}-${h.toRadixString(16).padLeft(16, '0')}';
+}
+
+/// ملفات مكتبة الاستيكرات بنفس ترتيب بناء الحزم (الأقدم أولاً) — نفس ترتيب تاب استيكراتي.
+List<File> stickerLibFiles() {
+  final files = <File>[];
+  try {
+    final d = Directory(kStickerLibDir);
+    if (d.existsSync()) {
+      for (final e in d.listSync(followLinks: false)) {
+        if (e is File &&
+            ['webp', 'png', 'gif', 'jpg', 'jpeg'].contains(
+                p.extension(e.path).toLowerCase().replaceFirst('.', ''))) {
+          files.add(e);
+        }
+      }
+      files.sort(
+          (a, b) => a.lastModifiedSync().compareTo(b.lastModifiedSync()));
+    }
+  } catch (_) {}
+  return files;
+}
+
+/// بصمات ملفات المكتبة بالترتيب (علامة خاصة لأي ملف تعذرت قراءته).
+Future<List<String>> stickerLibFingerprints() async {
+  final out = <String>[];
+  for (final f in stickerLibFiles()) {
+    try {
+      out.add(contentFingerprint(await f.readAsBytes()));
+    } catch (_) {
+      out.add('unreadable:${f.path}');
+    }
+  }
+  return out;
+}
+
 /// اختيار نسخة واتساب المستهدفة (بيزنس أو العادي).
 class WaApp {
   static const String business = 'com.whatsapp.w4b';
@@ -1077,8 +1125,10 @@ class Bubble {
 }
 
 /// جلسة الإرسال الفردي: وضع المراجعة (البحث في القائمة الرئيسية) أو المشاركة المباشرة.
+/// عند تمرير stickers (الوضع التجريبي) تُرسل الفقاعة كل استيكر من لوحة واتساب مباشرة:
+/// pack = رقم الحزمة (1-أساسي)، pos = موضع الاستيكر داخلها (0-أساسي).
 Map<String, dynamic> jobSession(Map<String, dynamic> job,
-    {String mode = 'review'}) {
+    {String mode = 'review', List<Map<String, int>>? stickers}) {
   final gs = job['groups'] as List;
   final st = job['st'] as List;
   return {
@@ -1087,10 +1137,15 @@ Map<String, dynamic> jobSession(Map<String, dynamic> job,
     'pkg': WaApp.pkg,
     'text': job['text'] as String,
     'media': (job['media'] as List).map((e) => e.toString()).toList(),
+    if (stickers != null && stickers.isNotEmpty) ...{
+      'realSticker': true,
+      'stickers': stickers,
+    },
     'items': List.generate(gs.length, (i) {
       final g = G.fromJson(gs[i] as Map<String, dynamic>);
       return {
         't': g.title,
+        'n': g.name,
         'k': waKey(g),
         'l': true,
         's': Bubble.code(st[i] as String),
@@ -1474,6 +1529,9 @@ class _StickersTabState extends State<StickersTab> {
           {'paths': lib.map((f) => f.path).toList()});
       final ps = r == null || r.isEmpty ? <dynamic>[] : jsonDecode(r) as List;
       setState(() => packs = ps);
+      // بصمة ترتيب المكتبة وقت تجهيز الحزم: الوضع التجريبي يتحقق منها قبل الإرسال.
+      Store.data['packSig'] = (await stickerLibFingerprints()).join('|');
+      await Store.save();
       snack(context, 'تم تجهيز ${ps.length} حزمة — أضيفيها لواتساب من القائمة');
     } on PlatformException catch (e) {
       snack(context, 'تعذر تجهيز الحزم: ${e.message}');
@@ -2337,6 +2395,12 @@ class _SendScreenState extends State<SendScreen> with WidgetsBindingObserver {
   bool opened = false;
   late String sendMode;
 
+  /// وضع الاستيكر الحقيقي التجريبي (يظهر فقط لمهام الاستيكرات مع حزم مضافة لواتساب).
+  bool realSticker = Store.data['realSticker'] == true;
+
+  Map get _packsAdded =>
+      Store.data['stickerAdded'] is Map ? Store.data['stickerAdded'] as Map : {};
+
   @override
   void initState() {
     super.initState();
@@ -2396,13 +2460,69 @@ class _SendScreenState extends State<SendScreen> with WidgetsBindingObserver {
         return;
       }
     }
-    final err = await Bubble.start(jobSession(job, mode: sendMode), i);
+    List<Map<String, int>>? stickerMap;
+    if (realSticker && job['kind'] == 'stickers') {
+      stickerMap = await _realStickerMapping();
+      if (!mounted) return;
+      if (stickerMap == null) return; // السبب عُرض داخل الدالة
+    }
+    final err = await Bubble.start(
+        jobSession(job, mode: sendMode, stickers: stickerMap), i);
     if (!mounted) return;
     if (err != null) {
       snack(context, err);
       return;
     }
     setState(() => opened = true);
+  }
+
+  /// فحوص الوضع التجريبي قبل البدء: تطابق وسائط المهمة مع مكتبة الاستيكرات
+  /// وتتأكد أن الحزم المطلوبة مضافة لواتساب ولم تتغير المكتبة بعد تجهيزها.
+  /// يرجع null مع عرض السبب عند أي شك — لا يبدأ الإرسال في هذه الحالة.
+  Future<List<Map<String, int>>?> _realStickerMapping() async {
+    final media = (job['media'] as List).map((e) => e.toString()).toList();
+    final lib = stickerLibFiles();
+    if (lib.isEmpty) {
+      snack(context,
+          'الوضع التجريبي: مكتبة الاستيكرات فارغة — استوردي استيكرات في تاب استيكراتي أو أطفي الوضع التجريبي');
+      return null;
+    }
+    final fps = await stickerLibFingerprints();
+    if (!mounted) return null;
+    if (Store.data['packSig'] != fps.join('|')) {
+      snack(context,
+          'الوضع التجريبي: مكتبة الاستيكرات اتغيرت بعد آخر تجهيز للحزم.\nاضغطي "إضافة إلى واتساب" في تاب استيكراتي وأضيفي الحزم من جديد، أو أطفي الوضع التجريبي.');
+      return null;
+    }
+    final out = <Map<String, int>>[];
+    for (final m in media) {
+      final String fp;
+      try {
+        fp = contentFingerprint(await File(m).readAsBytes());
+      } catch (_) {
+        snack(context, 'الوضع التجريبي: تعذرت قراءة أحد ملفات الاستيكر');
+        return null;
+      }
+      final idx = fps.indexOf(fp);
+      if (idx < 0) {
+        snack(context,
+            'الوضع التجريبي: أحد الاستيكرات غير موجود في مكتبة استيكراتي.\nأضيفيه للمكتبة وأعيدي تجهيز الحزم وإضافتها، أو أطفي الوضع التجريبي.');
+        return null;
+      }
+      out.add({
+        'pack': idx ~/ kStickerPackLimit + 1,
+        'pos': idx % kStickerPackLimit,
+      });
+    }
+    if (!mounted) return null;
+    for (final n in out.map((e) => e['pack']!).toSet()) {
+      if (!_packsAdded.containsKey('a2r_$n')) {
+        snack(context,
+            'الوضع التجريبي: الحزمة رقم $n غير مضافة لواتساب.\nأضيفيها من تاب استيكراتي أو أطفي الوضع التجريبي.');
+        return null;
+      }
+    }
+    return out;
   }
 
   List get _st => job['st'] as List;
@@ -2644,6 +2764,36 @@ class _SendScreenState extends State<SendScreen> with WidgetsBindingObserver {
             ),
           ),
           const SizedBox(height: 8),
+          if (kind == 'stickers' && _packsAdded.isNotEmpty) ...[
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 4, 12, 10),
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('إرسال كاستيكر حقيقي (تجريبي)'),
+                        subtitle: const Text(
+                            'الفقاعة تفتح لوحة الاستيكرات في واتساب وتضغط الاستيكر من حزمتك بدل إرساله كصورة'),
+                        value: realSticker,
+                        onChanged: (v) {
+                          setState(() => realSticker = v);
+                          Store.data['realSticker'] = v;
+                          Store.save();
+                        },
+                      ),
+                      if (realSticker)
+                        Text(
+                          'وضع تجريبي قد يتعطل مع أي تحديث لواتساب. الأمان أولاً: عند أي شك في الجروب أو الحزمة يتخطى الجروب بدون إرسال أي شيء، والسبب يظهر في الفقاعة. طريقة البحث (مراجعة/مشاركة) لا تنطبق في هذا الوضع.',
+                          style: t.textTheme.bodySmall
+                              ?.copyWith(color: t.colorScheme.error),
+                        ),
+                    ]),
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
           BubbleCard(
               startLabel: 'تشغيل الفقاعة من هذا الجروب',
               onStart: () => _startBubble(i)),
