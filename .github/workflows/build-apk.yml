@@ -243,8 +243,8 @@ jobs:
           import org.json.JSONArray
           import org.json.JSONObject
 
-          /** عنصر في الجلسة: st = 0 معلّق، 1 تم، 2 تخطي. launch = يفتح واتساب عند الوصول له. */
-          class SItem(val title: String, val key: String, val launch: Boolean, var st: Int)
+          /** عنصر في الجلسة: st = 0 معلّق، 1 تم، 2 تخطي. launch = يفتح واتساب عند الوصول له. name = اسم الجروب للتحقق. */
+          class SItem(val title: String, val key: String, val launch: Boolean, var st: Int, val name: String = "")
 
           class Sess(
               val id: String,
@@ -258,7 +258,11 @@ jobs:
               /** وضع المصنف المفتوح: أسماء المحادثات التي فُتحت بالفعل حتى لا تتكرر. */
               val seen: MutableSet<String> = mutableSetOf(),
               /** وضع المصنف المفتوح: true عند الوصول لنهاية القائمة. */
-              var lwDone: Boolean = false
+              var lwDone: Boolean = false,
+              /** الوضع التجريبي: إرسال الاستيكرات من لوحة واتساب مباشرة بدل المشاركة كصورة. */
+              val realSticker: Boolean = false,
+              /** الاستيكرات المطلوبة لكل جروب: (رقم الحزمة 1-أساسي، موضع الاستيكر داخلها 0-أساسي). */
+              val stickers: List<Pair<Int, Int>> = emptyList()
           ) {
               fun toJson(): String {
                   val o = JSONObject()
@@ -271,6 +275,7 @@ jobs:
                   for (x in items) {
                       val j = JSONObject()
                       j.put("t", x.title)
+                      j.put("n", x.name)
                       j.put("k", x.key)
                       j.put("l", x.launch)
                       j.put("s", x.st)
@@ -281,6 +286,17 @@ jobs:
                   o.put("active", active)
                   if (seen.isNotEmpty()) o.put("seen", JSONArray(seen.toList()))
                   o.put("lwDone", lwDone)
+                  if (realSticker) {
+                      o.put("realSticker", true)
+                      val sa = JSONArray()
+                      for (pr in stickers) {
+                          val pj = JSONObject()
+                          pj.put("pack", pr.first)
+                          pj.put("pos", pr.second)
+                          sa.put(pj)
+                      }
+                      o.put("stickers", sa)
+                  }
                   return o.toString()
               }
 
@@ -316,9 +332,19 @@ jobs:
                                   j.optString("t", ""),
                                   j.optString("k", ""),
                                   j.optBoolean("l", true),
-                                  j.optInt("s", 0)
+                                  j.optInt("s", 0),
+                                  j.optString("n", "")
                               )
                           )
+                      }
+                      val realSticker = o.optBoolean("realSticker", false)
+                      val stickers = ArrayList<Pair<Int, Int>>()
+                      val stkArr = o.optJSONArray("stickers")
+                      if (stkArr != null) {
+                          for (i in 0 until stkArr.length()) {
+                              val pj = stkArr.getJSONObject(i)
+                              stickers.add(Pair(pj.optInt("pack", 1), pj.optInt("pos", 0)))
+                          }
                       }
                       val rawPkg = o.optString("pkg", ShareUtil.BUSINESS)
                       val pkg = if (rawPkg == ShareUtil.NORMAL) ShareUtil.NORMAL else ShareUtil.BUSINESS
@@ -337,7 +363,9 @@ jobs:
                           o.optInt("idx", -1),
                           o.optBoolean("active", true),
                           seen,
-                          o.optBoolean("lwDone", false)
+                          o.optBoolean("lwDone", false),
+                          realSticker,
+                          stickers
                       )
                   }
               }
@@ -758,10 +786,15 @@ jobs:
               }
 
               override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-                  if (!pActive) return
+                  if (!pActive && !rsActive) return
                   val pkg = event?.packageName?.toString() ?: return
                   if (pkg != targetPkg()) return
                   val now = System.currentTimeMillis()
+                  if (rsActive) {
+                      if (now - rsLastStep < 220L) return
+                      h.post { rsStep(rsToken, true) }
+                      return
+                  }
                   if (now - pLastStep < 180L) return
                   h.post { stepSearch(pToken, true) }
               }
@@ -792,6 +825,7 @@ jobs:
                   pRunnable?.let { h.removeCallbacks(it) }
                   pRunnable = null
                   token++
+                  cancelRs()
               }
 
               /** يبدأ الجلسة ويفتح العنصر at (أو أول معلّق) فوراً. */
@@ -997,7 +1031,24 @@ jobs:
                   render()
                   cancelSearch()
                   val pkg = s.pkg
-                  if (s.mode == "review") {
+                  if (s.realSticker && s.stickers.isNotEmpty()) {
+                      // الوضع التجريبي: يفتح الرئيسية مثل المراجعة ثم يشغّل تدفق الاستيكر الحقيقي.
+                      var delay = 500L
+                      val curPkg = rootInActiveWindow?.packageName?.toString()
+                      if (force || curPkg != pkg) {
+                          try {
+                              ShareUtil.openMain(this, pkg)
+                              delay = 700L
+                          } catch (e: ActivityNotFoundException) {
+                              note("واتساب غير مثبت")
+                              return
+                          } catch (e: Exception) {
+                              note("تعذر فتح واتساب")
+                              return
+                          }
+                      }
+                      rsBegin(delay)
+                  } else if (s.mode == "review") {
                       var delay = 150L
                       val curPkg = rootInActiveWindow?.packageName?.toString()
                       if (force || curPkg != pkg) {
@@ -1077,6 +1128,10 @@ jobs:
                   val s = sess ?: return
                   val item = s.items.getOrNull(s.idx) ?: return
                   cancelSearch()
+                  if (s.realSticker && s.stickers.isNotEmpty()) {
+                      rsBegin(150L)
+                      return
+                  }
                   beginSearch(item.key, s.mode, 100L)
               }
 
@@ -1172,6 +1227,503 @@ jobs:
                       }
                   }
                   scheduleStep(my, 320L)
+              }
+
+              // ---------------------------------------------------------------- الاستيكر الحقيقي (وضع تجريبي)
+              // يفتح الجروب بعد التحقق من اسمه، يفتح لوحة الاستيكرات في واتساب،
+              // يختار حزمتنا من الشريط الأفقي، ويضغط الاستيكر المطلوب من الشبكة.
+              // لا يضغط زر إرسال أبداً، وعند أي شك يلغي ويتخطى الجروب بدون إرسال.
+
+              private var rsActive = false
+              private var rsToken = 0
+              private var rsState = 0
+              private var rsAttempt = 0
+              private var rsScrolls = 0
+              private var rsStripScrolls = 0
+              private var rsStickerIdx = 0
+              private var rsRowName = ""
+              private var rsLastStep = 0L
+              private var rsRunnable: Runnable? = null
+
+              private fun cancelRs() {
+                  rsActive = false
+                  rsRunnable?.let { h.removeCallbacks(it) }
+                  rsRunnable = null
+                  rsToken++
+              }
+
+              private fun rsSchedule(my: Int, delayMs: Long) {
+                  rsRunnable?.let { h.removeCallbacks(it) }
+                  val r = Runnable { rsStep(my, false) }
+                  rsRunnable = r
+                  h.postDelayed(r, delayMs)
+              }
+
+              /** بداية تدفق الاستيكر الحقيقي للعنصر الحالي. */
+              private fun rsBegin(delayMs: Long) {
+                  cancelRs()
+                  rsActive = true
+                  rsState = 0
+                  rsAttempt = 0
+                  rsScrolls = 0
+                  rsStripScrolls = 0
+                  rsStickerIdx = 0
+                  rsRowName = ""
+                  rsLastStep = 0L
+                  val my = rsToken
+                  note("وضع الاستيكر الحقيقي (تجريبي): جاري البحث…")
+                  rsSchedule(my, delayMs)
+              }
+
+              /** إيقاف التدفق التجريبي وتخطي الجروب مع عرض السبب — لا يُرسل أي شيء عند الشك. */
+              private fun rsAbort(reason: String) {
+                  rsActive = false
+                  note("تجريبي: $reason — تخطي بدون إرسال")
+                  advance(2)
+              }
+
+              private fun rsStep(my: Int, fromEvent: Boolean) {
+                  if (!rsActive || my != rsToken) return
+                  val s = sess
+                  if (s == null || !s.active) { rsActive = false; return }
+                  val item = s.items.getOrNull(s.idx)
+                  if (item == null) { rsActive = false; return }
+                  if (!fromEvent) rsAttempt++
+                  if (rsAttempt > 35) {
+                      rsAbort("انتهت المهلة")
+                      return
+                  }
+                  rsLastStep = System.currentTimeMillis()
+                  val root = rootInActiveWindow
+                  if (root == null || root.packageName?.toString() != targetPkg()) {
+                      rsSchedule(my, 400L)
+                      return
+                  }
+                  when (rsState) {
+                      0 -> { // كتابة كلمة البحث في القائمة الرئيسية
+                          val f = findSearchField(root, rsAttempt >= 8)
+                          if (f != null) {
+                              val args = Bundle()
+                              args.putCharSequence(
+                                  AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                                  item.key
+                              )
+                              f.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                              if (f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+                                  rsState = 1
+                                  rsAttempt = 0
+                                  rsSchedule(my, 500L)
+                                  return
+                              }
+                          } else {
+                              if (findChatInput(root) != null && rsAttempt < 5) {
+                                  performGlobalAction(GLOBAL_ACTION_BACK)
+                                  rsSchedule(my, 450L)
+                                  return
+                              }
+                              val b = findSearchButton(root)
+                              if (b != null) clickNode(b)
+                          }
+                          rsSchedule(my, 380L)
+                      }
+                      1 -> { // اختيار نتيجة البحث: نتيجة واحدة مطابقة فقط وإلا إلغاء
+                          val rows = collectRows(root)
+                          val named = ArrayList<Pair<AccessibilityNodeInfo, String>>()
+                          for (r in rows) {
+                              val nm = rowName(r)
+                              if (nm.isNotEmpty()) named.add(Pair(r, nm))
+                          }
+                          val matchKey = named.filter {
+                              normContains(it.second, item.key) || normContains(item.key, it.second)
+                          }
+                          val pick = when {
+                              matchKey.size == 1 -> matchKey[0]
+                              matchKey.isEmpty() && named.size == 1 -> named[0]
+                              else -> null
+                          }
+                          if (pick != null) {
+                              rsRowName = pick.second
+                              if (!clickNode(pick.first)) {
+                                  rsAbort("تعذر فتح الجروب")
+                                  return
+                              }
+                              rsState = 2
+                              rsAttempt = 0
+                              rsSchedule(my, 650L)
+                              return
+                          }
+                          if (matchKey.size > 1) {
+                              rsAbort("أكثر من نتيجة مطابقة لكلمة البحث")
+                              return
+                          }
+                          rsSchedule(my, 420L)
+                      }
+                      2 -> { // التحقق من اسم الجروب داخل المحادثة قبل أي لمس للوحة
+                          val input = findChatInput(root)
+                          val title = chatTitle(root)
+                          if (input != null && title.isNotEmpty()) {
+                              if (normText(title) == normText(rsRowName) ||
+                                  normContains(title, rsRowName) ||
+                                  normContains(rsRowName, title)
+                              ) {
+                                  rsState = 3
+                                  rsAttempt = 0
+                                  rsScrolls = 0
+                                  rsSchedule(my, 450L)
+                                  return
+                              }
+                              rsAbort("اسم الجروب غير مطابق")
+                              return
+                          }
+                          rsSchedule(my, 400L)
+                      }
+                      3 -> { // زر الإيموجي بجوار حقل الكتابة
+                          val e = findEmojiButton(root)
+                          if (e != null) {
+                              if (!clickNode(e)) {
+                                  rsAbort("تعذر الضغط على زر الإيموجي")
+                                  return
+                              }
+                              rsState = 4
+                              rsAttempt = 0
+                              rsSchedule(my, 600L)
+                              return
+                          }
+                          if (rsAttempt > 14) { rsAbort("لم أجد زر الإيموجي"); return }
+                          rsSchedule(my, 400L)
+                      }
+                      4 -> { // تاب الاستيكرات داخل اللوحة
+                          val t = findStickerTab(root)
+                          if (t != null) {
+                              if (!clickNode(t)) {
+                                  rsAbort("تعذر فتح تاب الاستيكرات")
+                                  return
+                              }
+                              rsState = 5
+                              rsAttempt = 0
+                              rsStripScrolls = 0
+                              rsSchedule(my, 600L)
+                              return
+                          }
+                          if (rsAttempt > 14) { rsAbort("لم أجد تاب الاستيكرات"); return }
+                          rsSchedule(my, 400L)
+                      }
+                      5 -> { // أيقونة حزمتنا في الشريط الأفقي للحزم
+                          val target = s.stickers.getOrNull(rsStickerIdx)
+                          if (target == null) { rsAbort("لا يوجد استيكر مطلوب"); return }
+                          val icon = findPackIcon(root, target.first)
+                          if (icon != null) {
+                              if (!clickNode(icon)) {
+                                  rsAbort("تعذر فتح الحزمة")
+                                  return
+                              }
+                              rsState = 6
+                              rsAttempt = 0
+                              rsScrolls = 0
+                              rsSchedule(my, 600L)
+                              return
+                          }
+                          if (rsAttempt > 12) { rsAbort("لم أجد أيقونة الحزمة"); return }
+                          rsSchedule(my, 420L)
+                      }
+                      6 -> { // الضغط على الاستيكر المطلوب داخل شبكة الحزمة
+                          val target = s.stickers.getOrNull(rsStickerIdx)
+                          if (target == null) { rsAbort("لا يوجد استيكر مطلوب"); return }
+                          val cell = findStickerCell(root, target.second)
+                          if (cell != null) {
+                              if (!clickNode(cell)) {
+                                  rsAbort("تعذر الضغط على الاستيكر")
+                                  return
+                              }
+                              rsStickerIdx++
+                              if (rsStickerIdx >= s.stickers.size) {
+                                  rsActive = false
+                                  note("✓ أُرسل الاستيكر الحقيقي")
+                                  h.postDelayed({ advance(1) }, 600)
+                                  return
+                              }
+                              // اللوحة تُغلق بعد كل استيكر: نعيد فتحها للاستيكر التالي
+                              rsState = 3
+                              rsAttempt = 0
+                              rsSchedule(my, 750L)
+                              return
+                          }
+                          if (rsAttempt > 16) { rsAbort("لم أجد الاستيكر داخل الحزمة"); return }
+                          rsSchedule(my, 420L)
+                      }
+                  }
+              }
+
+              /** تطبيع نص للمقارنة: أرقام عربية/فارسية إلى لاتينية، توحيد الألف والياء، إزالة علامات الاتجاه. */
+              private fun normText(x: String): String {
+                  val sb = StringBuilder()
+                  for (c in x) {
+                      sb.append(
+                          when (c) {
+                              in '\u0660'..'\u0669' -> '0' + (c - '\u0660')
+                              in '\u06f0'..'\u06f9' -> '0' + (c - '\u06f0')
+                              'أ', 'إ', 'آ' -> 'ا'
+                              'ى' -> 'ي'
+                              else -> c
+                          }
+                      )
+                  }
+                  return sb.toString()
+                      .replace(Regex("[\\u200e\\u200f\\u202a-\\u202e]"), "")
+                      .replace(Regex("\\s+"), " ")
+                      .trim()
+              }
+
+              /** هل يحتوي a على b بعد التطبيع؟ */
+              private fun normContains(a: String, b: String): Boolean {
+                  val y = normText(b)
+                  return y.isNotEmpty() && normText(a).contains(y)
+              }
+
+              /** عنوان المحادثة من الترويسة: معرّف conversation_contact_name أو أول نص داخل شريط الأدوات. */
+              private fun chatTitle(root: AccessibilityNodeInfo): String {
+                  var byId: AccessibilityNodeInfo? = null
+                  fun walk(n: AccessibilityNodeInfo?, depth: Int) {
+                      if (n == null || depth > 40 || byId != null) return
+                      val id = n.viewIdResourceName ?: ""
+                      if (n.isVisibleToUser && id.contains("conversation_contact_name", true)) {
+                          byId = n
+                          return
+                      }
+                      for (i in 0 until n.childCount) walk(n.getChild(i), depth + 1)
+                  }
+                  walk(root, 0)
+                  val t1 = byId?.text?.toString() ?: ""
+                  if (t1.isNotEmpty()) return t1
+                  var tb: AccessibilityNodeInfo? = null
+                  fun walk2(n: AccessibilityNodeInfo?, depth: Int) {
+                      if (n == null || depth > 40 || tb != null) return
+                      val cls = n.className?.toString() ?: ""
+                      if (cls.contains("Toolbar", true) || cls.contains("ActionBar", true)) {
+                          tb = n
+                          return
+                      }
+                      for (i in 0 until n.childCount) walk2(n.getChild(i), depth + 1)
+                  }
+                  walk2(root, 0)
+                  val bar = tb ?: return ""
+                  fun firstText(n: AccessibilityNodeInfo?, depth: Int): String {
+                      if (n == null || depth > 8) return ""
+                      val tx = n.text?.toString() ?: ""
+                      if (tx.isNotEmpty()) return tx
+                      for (i in 0 until n.childCount) {
+                          val r = firstText(n.getChild(i), depth + 1)
+                          if (r.isNotEmpty()) return r
+                      }
+                      return ""
+                  }
+                  return firstText(bar, 0)
+              }
+
+              /** زر الإيموجي في صف حقل الكتابة (بالوصف أو المعرّف، وليس بالإحداثيات). */
+              private fun findEmojiButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+                  val input = findChatInput(root) ?: return null
+                  val ib = android.graphics.Rect()
+                  input.getBoundsInScreen(ib)
+                  var best: AccessibilityNodeInfo? = null
+                  fun walk(n: AccessibilityNodeInfo?, depth: Int) {
+                      if (n == null || depth > 40 || best != null) return
+                      if (n.isVisibleToUser) {
+                          val id = n.viewIdResourceName ?: ""
+                          val d = n.contentDescription?.toString() ?: ""
+                          val cls = n.className?.toString() ?: ""
+                          val looks = !cls.contains("EditText") && (id.contains("emoji", true) ||
+                              d.contains("emoji", true) || d.contains("إيموجي", true) ||
+                              d.contains("وجوه تعبيرية", true))
+                          if (looks) {
+                              val b = android.graphics.Rect()
+                              n.getBoundsInScreen(b)
+                              if (kotlin.math.abs(b.centerY() - ib.centerY()) < ib.height() * 2) {
+                                  best = n
+                                  return
+                              }
+                          }
+                      }
+                      for (i in 0 until n.childCount) walk(n.getChild(i), depth + 1)
+                  }
+                  walk(root, 0)
+                  return best
+              }
+
+              /** تاب الاستيكرات داخل لوحة الإيموجي المفتوحة (أسفل الشاشة). */
+              private fun findStickerTab(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+                  val panelTop = (resources.displayMetrics.heightPixels * 0.40).toInt()
+                  var best: AccessibilityNodeInfo? = null
+                  fun walk(n: AccessibilityNodeInfo?, depth: Int) {
+                      if (n == null || depth > 40 || best != null) return
+                      if (n.isVisibleToUser) {
+                          val id = n.viewIdResourceName ?: ""
+                          val d = n.contentDescription?.toString() ?: ""
+                          val looks = id.contains("sticker", true) || d.contains("sticker", true) ||
+                              d.contains("ملصق", true) || d.contains("استيكر", true)
+                          if (looks) {
+                              val b = android.graphics.Rect()
+                              n.getBoundsInScreen(b)
+                              if (b.top >= panelTop) {
+                                  best = n
+                                  return
+                              }
+                          }
+                      }
+                      for (i in 0 until n.childCount) walk(n.getChild(i), depth + 1)
+                  }
+                  walk(root, 0)
+                  return best
+              }
+
+              /** هل يحوي العقدة صورة (هو أو أحد أبنائه)؟ */
+              private fun hasImage(n: AccessibilityNodeInfo, depth: Int): Boolean {
+                  if (depth > 4) return false
+                  val cls = n.className?.toString() ?: ""
+                  if (cls.contains("ImageView") || cls.contains("ImageButton")) return true
+                  for (i in 0 until n.childCount) {
+                      val c = n.getChild(i) ?: continue
+                      if (hasImage(c, depth + 1)) return true
+                  }
+                  return false
+              }
+
+              /** حاوية الشريط الأفقي لأيقونات الحزم: صف واحد قصير من الأيقونات داخل اللوحة. */
+              private fun findStrip(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+                  val panelTop = (resources.displayMetrics.heightPixels * 0.40).toInt()
+                  var best: AccessibilityNodeInfo? = null
+                  var bestH = Int.MAX_VALUE
+                  fun walk(n: AccessibilityNodeInfo?, depth: Int) {
+                      if (n == null || depth > 40) return
+                      val cls = n.className?.toString() ?: ""
+                      if ((cls.contains("RecyclerView") || cls.contains("HorizontalScrollView") ||
+                              cls.contains("LinearLayout") || cls.contains("ViewGroup")) &&
+                          n.isVisibleToUser && n.childCount >= 2
+                      ) {
+                          val b = android.graphics.Rect()
+                          n.getBoundsInScreen(b)
+                          var imgs = 0
+                          for (i in 0 until n.childCount) {
+                              val c = n.getChild(i) ?: continue
+                              if (c.isVisibleToUser && hasImage(c, 0)) imgs++
+                          }
+                          if (imgs >= 2 && b.top >= panelTop &&
+                              b.height() >= dp(30) && b.height() <= dp(120) && b.height() < bestH
+                          ) {
+                              best = n
+                              bestH = b.height()
+                          }
+                      }
+                      for (i in 0 until n.childCount) walk(n.getChild(i), depth + 1)
+                  }
+                  walk(root, 0)
+                  return best
+              }
+
+              /**
+               * أيقونة الحزمة رقم packNo (1-أساسي) في الشريط.
+               * يستبعد أيقونات المفضلة/الأخيرة بالوصف فقط؛ بدون أوصاف كافية يرجع null (إلغاء احترازي).
+               */
+              private fun findPackIcon(root: AccessibilityNodeInfo, packNo: Int): AccessibilityNodeInfo? {
+                  val strip = findStrip(root) ?: return null
+                  val icons = ArrayList<AccessibilityNodeInfo>()
+                  for (i in 0 until strip.childCount) {
+                      val c = strip.getChild(i) ?: continue
+                      if (c.isVisibleToUser) icons.add(c)
+                  }
+                  icons.sortBy {
+                      val b = android.graphics.Rect()
+                      it.getBoundsInScreen(b)
+                      b.left
+                  }
+                  if (icons.isEmpty()) return null
+                  fun descOf(n: AccessibilityNodeInfo): String {
+                      val d = n.contentDescription?.toString() ?: ""
+                      if (d.isNotEmpty()) return d
+                      for (i in 0 until n.childCount) {
+                          val c = n.getChild(i) ?: continue
+                          val cd = c.contentDescription?.toString() ?: ""
+                          if (cd.isNotEmpty()) return cd
+                      }
+                      return ""
+                  }
+                  val special = BooleanArray(icons.size)
+                  var anyDesc = false
+                  for (i in icons.indices) {
+                      val d = descOf(icons[i])
+                      if (d.isNotEmpty()) anyDesc = true
+                      special[i] = d.contains("favorite", true) || d.contains("مفضل", true) ||
+                          d.contains("recent", true) || d.contains("أخير", true) ||
+                          d.contains("star", true) || d.contains("clock", true)
+                  }
+                  if (!anyDesc) {
+                      // لا أوصاف إطلاقاً: لا نميز المفضلة من الحزم — لكن نحاول التمرير ثم نستسلم بأمان
+                      if (rsStripScrolls < 4 && strip.isScrollable) {
+                          if (strip.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) {
+                              rsStripScrolls++
+                          }
+                      }
+                      return null
+                  }
+                  val packs = ArrayList<AccessibilityNodeInfo>()
+                  for (i in icons.indices) {
+                      if (!special[i]) packs.add(icons[i])
+                  }
+                  if (packNo < 1 || packNo > packs.size) {
+                      if (rsStripScrolls < 4 && strip.isScrollable) {
+                          if (strip.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) {
+                              rsStripScrolls++
+                              return null
+                          }
+                      }
+                      return null
+                  }
+                  return packs[packNo - 1]
+              }
+
+              /**
+               * خلية الاستيكر ذات الموضع pos (0-أساسي) داخل شبكة الحزمة.
+               * تعتمد على فهرس العنصر (collectionItemInfo) لا على الإحداثيات؛
+               * بدون فهرس دقيق يرجع null (إلغاء احترازي). الشبكة = أطول قائمة مفهرسة في اللوحة.
+               */
+              private fun findStickerCell(root: AccessibilityNodeInfo, pos: Int): AccessibilityNodeInfo? {
+                  var grid: AccessibilityNodeInfo? = null
+                  var gridH = 0
+                  fun walk(n: AccessibilityNodeInfo?, depth: Int) {
+                      if (n == null || depth > 40) return
+                      val cls = n.className?.toString() ?: ""
+                      if ((cls.contains("RecyclerView") || cls.contains("GridView")) &&
+                          n.isVisibleToUser && n.childCount >= 2
+                      ) {
+                          var withInfo = 0
+                          for (i in 0 until n.childCount) {
+                              if (n.getChild(i)?.collectionItemInfo != null) withInfo++
+                          }
+                          if (withInfo >= 2) {
+                              val b = android.graphics.Rect()
+                              n.getBoundsInScreen(b)
+                              if (b.height() > gridH) {
+                                  grid = n
+                                  gridH = b.height()
+                              }
+                          }
+                      }
+                      for (i in 0 until n.childCount) walk(n.getChild(i), depth + 1)
+                  }
+                  walk(root, 0)
+                  val g = grid ?: return null
+                  val cols = g.collectionInfo?.columnCount ?: 0
+                  if (cols < 1) return null
+                  for (i in 0 until g.childCount) {
+                      val c = g.getChild(i) ?: continue
+                      val ci = c.collectionItemInfo ?: continue
+                      if (ci.rowIndex * cols + ci.columnIndex == pos) return c
+                  }
+                  // الموضع غير ظاهر بعد: مرر الشبكة للأسفل ثم أعد المحاولة (الخطوة القادمة)
+                  if (rsScrolls < 10 && g.isScrollable) {
+                      if (g.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) rsScrolls++
+                  }
+                  return null
               }
 
               // ---------------------------------------------------------------- أدوات التعرف على الحقول
@@ -1314,7 +1866,7 @@ jobs:
                       val cur = s.items[s.idx]
                       a.text = "${s.idx + 1}/$total  •  ${cur.key}"
                       b.text = noteText ?: cur.title
-                      btnPrep?.visibility = if (s.mode == "review") View.VISIBLE else View.GONE
+                      btnPrep?.visibility = if (s.mode == "review" && !s.realSticker) View.VISIBLE else View.GONE
                       btnNext?.text = "التالي ◀"
                   }
               }
@@ -1556,19 +2108,22 @@ jobs:
                       copyClip(s.text)
                       note("✓ تم نسخ نص الرسالة")
                   })
-                  card.addView(btn("فتح المشاركة بالرسالة مباشرة") {
-                      hidePanel()
-                      try {
-                          cancelSearch()
-                          ShareUtil.send(this, s.text, s.media, true, s.pkg)
-                          val key = cur?.key ?: ""
-                          if (key.isNotEmpty()) {
-                              beginSearch(key, "share", 750L)
+                  // في الوضع التجريبي لا تُرسل الاستيكرات كصور أبداً حتى لا تتكرر الرسالة
+                  if (!s.realSticker) {
+                      card.addView(btn("فتح المشاركة بالرسالة مباشرة") {
+                          hidePanel()
+                          try {
+                              cancelSearch()
+                              ShareUtil.send(this, s.text, s.media, true, s.pkg)
+                              val key = cur?.key ?: ""
+                              if (key.isNotEmpty()) {
+                                  beginSearch(key, "share", 750L)
+                              }
+                          } catch (e: Exception) {
+                              note("تعذر فتح المشاركة")
                           }
-                      } catch (e: Exception) {
-                          note("تعذر فتح المشاركة")
-                      }
-                  })
+                      })
+                  }
                   card.addView(btn("إغلاق الفقاعة") {
                       hidePanel()
                       stopSession()
@@ -1633,7 +2188,7 @@ jobs:
           cat > android/app/src/main/res/values/a2r_strings.xml <<'XML'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
-              <string name="a2r_a11y_desc">يكتب كلمة البحث في واتساب بيزنس فقط ويعرض فقاعة التنقل بين الجروبات. لا يقرأ محادثاتك ولا يضغط على إرسال.</string>
+              <string name="a2r_a11y_desc">يكتب كلمة البحث في واتساب ويعرض فقاعة التنقل بين الجروبات. في الوضع التجريبي الاختياري يتحقق من اسم الجروب ثم يضغط الاستيكر المختار من لوحة الاستيكرات. لا يضغط زر إرسال أبداً.</string>
           </resources>
           XML
           cat > android/app/src/main/res/xml/file_paths.xml <<'XML'
