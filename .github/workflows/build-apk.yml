@@ -203,6 +203,29 @@ jobs:
                                       )
                                       result.success(true)
                                   }
+                                  "packList" -> {
+                                      result.success(StickerPacks.listJson(this))
+                                  }
+                                  "buildPacks" -> {
+                                      val paths = call.argument<List<String>>("paths") ?: emptyList()
+                                      Thread {
+                                          try {
+                                              val j = StickerPacks.build(this, paths)
+                                              runOnUiThread { result.success(j) }
+                                          } catch (e: Exception) {
+                                              runOnUiThread { result.error("PACK_FAILED", e.message, null) }
+                                          }
+                                      }.start()
+                                  }
+                                  "addPack" -> {
+                                      StickerPacks.addToWhatsApp(
+                                          this,
+                                          call.argument<String>("id") ?: "",
+                                          call.argument<String>("name") ?: "",
+                                          call.argument<String>("pkg") ?: ShareUtil.BUSINESS
+                                      )
+                                      result.success(true)
+                                  }
                                   else -> result.notImplemented()
                               }
                           } catch (e: ActivityNotFoundException) {
@@ -392,6 +415,233 @@ jobs:
                   intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                   ctx.startActivity(intent)
               }
+          }
+          KT
+          cat > $D/StickerPack.kt <<'KT'
+          package com.a2r.a2r_academy_sender
+
+          import android.app.Activity
+          import android.content.ContentProvider
+          import android.content.ContentValues
+          import android.content.Context
+          import android.content.Intent
+          import android.content.res.AssetFileDescriptor
+          import android.database.Cursor
+          import android.database.MatrixCursor
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Canvas
+          import android.graphics.RectF
+          import android.net.Uri
+          import android.os.Build
+          import android.os.ParcelFileDescriptor
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.io.FileOutputStream
+
+          /** حزم الاستيكرات: تحويل webp 512x512 وتقسيم 30 لكل حزمة وإضافة لواتساب عبر الـ Sticker API الرسمي. */
+          object StickerPacks {
+              const val LIMIT = 30
+
+              private fun root(ctx: Context) = File(ctx.filesDir, "stickerpacks")
+              private fun jsonFile(ctx: Context) = File(root(ctx), "packs.json")
+
+              fun listJson(ctx: Context): String =
+                  try { jsonFile(ctx).readText() } catch (e: Exception) { "[]" }
+
+              fun read(ctx: Context): JSONArray =
+                  try { JSONArray(listJson(ctx)) } catch (e: Exception) { JSONArray() }
+
+              /** يعيد بناء كل الحزم من مكتبة المستخدم. يرجع JSON بالحزم الناتجة. */
+              fun build(ctx: Context, paths: List<String>): String {
+                  val old = read(ctx)
+                  val oldVer = HashMap<String, Int>()
+                  for (i in 0 until old.length()) {
+                      val o = old.getJSONObject(i)
+                      oldVer[o.getString("id")] = o.optInt("version", 0)
+                  }
+                  root(ctx).deleteRecursively()
+                  root(ctx).mkdirs()
+
+                  val valid = paths.map { File(it) }.filter { it.exists() }
+                  val chunks = mutableListOf<MutableList<File>>()
+                  var cur = mutableListOf<File>()
+                  for (f in valid) {
+                      if (cur.size == LIMIT) { chunks.add(cur); cur = mutableListOf() }
+                      cur.add(f)
+                  }
+                  if (cur.isNotEmpty()) chunks.add(cur)
+                  // واتساب يشترط 3 استيكرات على الأقل في الحزمة: اسحب من السابقة عند الحاجة
+                  while (chunks.size > 1 && chunks.last().size < 3) {
+                      val prev = chunks[chunks.size - 2]
+                      if (prev.size <= 3) break
+                      chunks.last().add(0, prev.removeAt(prev.size - 1))
+                  }
+
+                  val out = JSONArray()
+                  var packIdx = 0
+                  for (chunk in chunks) {
+                      packIdx++
+                      val id = "a2r_$packIdx"
+                      val packDir = File(root(ctx), id)
+                      packDir.mkdirs()
+                      val stickers = JSONArray()
+                      var first: File? = null
+                      var count = 0
+                      for (f in chunk) {
+                          val dest = File(packDir, "s%03d.webp".format(count + 1))
+                          try {
+                              convert(f, dest, 512, 100)
+                          } catch (e: Exception) {
+                              continue
+                          }
+                          if (first == null) first = dest
+                          val so = JSONObject()
+                          so.put("f", dest.name)
+                          so.put("e", "\uD83D\uDE42")
+                          stickers.put(so)
+                          count++
+                      }
+                      if (count == 0) { packIdx--; packDir.deleteRecursively(); continue }
+                      if (first != null) convert(first, File(packDir, "tray.webp"), 96, 50)
+                      val o = JSONObject()
+                      o.put("id", id)
+                      o.put("name", "A2R $packIdx")
+                      o.put("publisher", "A2R")
+                      o.put("tray", "tray.webp")
+                      o.put("version", (oldVer[id] ?: 0) + 1)
+                      o.put("count", count)
+                      o.put("stickers", stickers)
+                      out.put(o)
+                  }
+                  jsonFile(ctx).writeText(out.toString())
+                  return out.toString()
+              }
+
+              /** تحويل صورة إلى webp بمقاس مربع مع شفافية وحد أقصى للحجم. الملصق المتحرك يتحول لإطار ثابت. */
+              private fun convert(src: File, dest: File, size: Int, maxKb: Int) {
+                  val bounds = BitmapFactory.Options()
+                  bounds.inJustDecodeBounds = true
+                  BitmapFactory.decodeFile(src.absolutePath, bounds)
+                  if (bounds.outWidth <= 0 || bounds.outHeight <= 0) throw Exception("صورة غير صالحة")
+                  var sample = 1
+                  while (bounds.outWidth / (sample * 2) >= size && bounds.outHeight / (sample * 2) >= size) sample *= 2
+                  val opts = BitmapFactory.Options()
+                  opts.inSampleSize = sample
+                  val bmp = BitmapFactory.decodeFile(src.absolutePath, opts)
+                      ?: throw Exception("تعذر فك الصورة")
+                  val scaled = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+                  val c = Canvas(scaled)
+                  val ratio = minOf(size.toFloat() / bmp.width, size.toFloat() / bmp.height)
+                  val w = (bmp.width * ratio).toInt()
+                  val hh = (bmp.height * ratio).toInt()
+                  val left = (size - w) / 2f
+                  val top = (size - hh) / 2f
+                  c.drawBitmap(bmp, null, RectF(left, top, left + w, top + hh), null)
+                  val format = if (Build.VERSION.SDK_INT >= 30)
+                      Bitmap.CompressFormat.WEBP_LOSSY else Bitmap.CompressFormat.WEBP
+                  var q = 90
+                  while (true) {
+                      val fos = FileOutputStream(dest)
+                      scaled.compress(format, q, fos)
+                      fos.close()
+                      if (dest.length() <= maxKb * 1024L || q <= 40) break
+                      q -= 15
+                  }
+                  bmp.recycle()
+                  scaled.recycle()
+              }
+
+              /** يفتح حوار واتساب الرسمي لإضافة الحزمة. */
+              fun addToWhatsApp(activity: Activity, id: String, name: String, pkg: String) {
+                  val intent = Intent("com.whatsapp.intent.action.ENABLE_STICKER_PACK")
+                  intent.putExtra("sticker_pack_id", id)
+                  intent.putExtra("sticker_pack_authority",
+                      activity.packageName + ".stickercontentprovider")
+                  intent.putExtra("sticker_pack_name", name)
+                  intent.setPackage(if (pkg == ShareUtil.NORMAL) ShareUtil.NORMAL else ShareUtil.BUSINESS)
+                  intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  activity.startActivity(intent)
+              }
+
+              private val MD_COLS = arrayOf(
+                  "sticker_pack_identifier", "sticker_pack_name", "sticker_pack_publisher",
+                  "sticker_pack_icon", "android_play_store_link", "ios_app_download_link_in_query",
+                  "publisher_email", "publisher_website", "privacy_policy_website",
+                  "license_agreement_website", "image_data_version", "avoid_cache",
+                  "animated_sticker_pack"
+              )
+
+              fun metadataCursor(packs: JSONArray, id: String?): Cursor {
+                  val c = MatrixCursor(MD_COLS)
+                  for (i in 0 until packs.length()) {
+                      val o = packs.getJSONObject(i)
+                      if (id != null && o.getString("id") != id) continue
+                      c.addRow(arrayOf(
+                          o.getString("id"), o.getString("name"), o.getString("publisher"),
+                          o.getString("tray"), "", "", "", "", "", "",
+                          o.optInt("version", 1), 0, 0
+                      ))
+                  }
+                  return c
+              }
+
+              fun stickersCursor(packs: JSONArray, id: String?): Cursor {
+                  val c = MatrixCursor(arrayOf("sticker_file_name", "sticker_emoji"))
+                  for (i in 0 until packs.length()) {
+                      val o = packs.getJSONObject(i)
+                      if (o.getString("id") != id) continue
+                      val st = o.getJSONArray("stickers")
+                      for (j in 0 until st.length()) {
+                          val so = st.getJSONObject(j)
+                          c.addRow(arrayOf(so.getString("f"), so.optString("e", "\uD83D\uDE42")))
+                      }
+                  }
+                  return c
+              }
+          }
+
+          /** مزوّد محتوى الحزم الذي يقرأه واتساب (مسارات /metadata و /stickers و /stickers_asset). */
+          class StickerPackProvider : ContentProvider() {
+              override fun onCreate(): Boolean = true
+
+              override fun query(
+                  uri: Uri,
+                  projection: Array<out String>?,
+                  selection: String?,
+                  selectionArgs: Array<out String>?,
+                  sortOrder: String?
+              ): Cursor {
+                  val packs = StickerPacks.read(context!!)
+                  val path = uri.path ?: ""
+                  return when {
+                      path == "/metadata" -> StickerPacks.metadataCursor(packs, null)
+                      path.startsWith("/metadata/") ->
+                          StickerPacks.metadataCursor(packs, uri.lastPathSegment)
+                      path.startsWith("/stickers/") ->
+                          StickerPacks.stickersCursor(packs, uri.lastPathSegment)
+                      else -> throw IllegalArgumentException("مسار غير معروف: " + uri)
+                  }
+              }
+
+              override fun getType(uri: Uri): String? = null
+
+              override fun openAssetFile(uri: Uri, mode: String): AssetFileDescriptor? {
+                  val segs = uri.pathSegments
+                  if (segs.size == 3 && segs[0] == "stickers_asset") {
+                      val f = File(context!!.filesDir, "stickerpacks/" + segs[1] + "/" + segs[2])
+                      if (f.exists()) {
+                          val pfd = ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
+                          return AssetFileDescriptor(pfd, 0, f.length())
+                      }
+                  }
+                  return null
+              }
+
+              override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+              override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+              override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
           }
           KT
           cat > $D/BubbleService.kt <<'KT'
@@ -1403,6 +1653,9 @@ jobs:
               '    <queries><package android:name="com.whatsapp.w4b"/><package android:name="com.whatsapp"/></queries>\n'
           )
           provider = (
+              '        <provider android:name="com.a2r.a2r_academy_sender.StickerPackProvider"\n'
+              '            android:authorities="${applicationId}.stickercontentprovider"\n'
+              '            android:exported="true" android:grantUriPermissions="true"/>\n'
               '        <provider android:name="androidx.core.content.FileProvider"\n'
               '            android:authorities="${applicationId}.fileprovider"\n'
               '            android:exported="false" android:grantUriPermissions="true">\n'
